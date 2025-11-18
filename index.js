@@ -8,7 +8,7 @@ app.use(express.json());
 
 // Env vars
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
 
 // ====== 獵影策略 system prompt ======
 const systemPrompt = `
@@ -160,32 +160,45 @@ async function replyToLine(replyToken, text) {
   );
 }
 
-// DeepSeek Chat API helper
-async function askDeepSeek(userText) {
-  const url = "https://api.deepseek.com/chat/completions";
+// Google AI (Gemini) Chat API helper
+async function askGoogleAI(userText) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}`;
 
   const body = {
-    model: "deepseek-chat",
-    messages: [
-      {
-        role: "system",
-        content: systemPrompt,
-      },
+    contents: [
       {
         role: "user",
-        content: userText,
+        parts: [
+          {
+            text:
+              systemPrompt +
+              "\n\n下面是使用者的問題，請依照上面的獵影策略規則來回答：" +
+              "\n\n" +
+              userText,
+          },
+        ],
       },
     ],
   };
 
   const res = await axios.post(url, body, {
     headers: {
-      Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
       "Content-Type": "application/json",
     },
   });
 
-  return res.data.choices[0].message.content;
+  const candidates = res.data.candidates;
+  if (!candidates || !candidates.length) {
+    return "Google AI 沒有回應內容，請稍後再試一次。";
+  }
+
+  const parts = candidates[0].content.parts;
+  if (!parts || !parts.length) {
+    return "Google AI 回傳格式異常，請稍後再試一次。";
+  }
+
+  // 把所有文字 parts 接起來
+  return parts.map((p) => p.text || "").join("\n");
 }
 
 app.post("/webhook", async (req, res) => {
@@ -201,7 +214,7 @@ app.post("/webhook", async (req, res) => {
 
       if (message.type === "text") {
         const userText = message.text;
-        const answer = await askDeepSeek(userText);
+        const answer = await askGoogleAI(userText);
         await replyToLine(replyToken, answer.substring(0, 1000));
       } else if (message.type === "image") {
         const fallbackText =
