@@ -162,7 +162,7 @@ async function replyToLine(replyToken, text) {
 
 // Google AI (Gemini) Chat API helper
 async function askGoogleAI(userText) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}`;
 
   const body = {
     contents: [
