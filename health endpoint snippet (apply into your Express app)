@@ -1,0 +1,4 @@
+// Add to index.upgraded.js (or index.js) where Express app exists
+app.get('/health', (req, res) => {
+res.json({ status: 'ok', uptime: process.uptime() });
+});
