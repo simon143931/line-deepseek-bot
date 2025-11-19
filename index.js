@@ -466,34 +466,4 @@ app.listen(PORT, () => {
 
   console.log("LINE Bot webhook listening on port " + PORT);
 
-});-- index.js END --
-
--- package.json START --
-
-{
-
-  "name": "line-deepseek-bot",
-
-  "version": "1.0.0",
-
-  "main": "index.js",
-
-  "type": "module",
-
-  "scripts": {
-
-    "start": "node index.js"
-
-  },
-
-  "dependencies": {
-
-    "axios": "^1.6.0",
-
-    "express": "^4.18.2",
-
-    "dotenv": "^16.3.1"
-
-  }
-
-}
+});
