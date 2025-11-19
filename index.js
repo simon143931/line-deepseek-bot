@@ -311,50 +311,125 @@ async function tryPost(url, body, headers = {}) {
   }
 }
 
-// ----🔧 Google AI API with Retry ----
-async function askGoogleAI(userText, systemPrompt) {
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
-    GOOGLE_AI_API_KEY;
+// ----🔧 更穩健的 askGoogleAI()（請直接替換舊函式） ----
+async function askGoogleAI(userText, systemPrompt = "") {
+  // 如果有人沒有設定 key，直接回覆友善錯誤
+  if (!GOOGLE_AI_API_KEY) {
+    console.error("Missing GOOGLE_AI_API_KEY");
+    return "⚠️ 系統設定錯誤：AI 金鑰未設定，請聯絡管理員。";
+  }
 
-  const body = {
+  // 構造 model URL（使用 env GOOGLE_AI_MODEL，預設保留）
+  const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
+  const baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent`;
+
+  // 先嘗試用 Authorization Bearer header（若你使用的是 OAuth token / service account）
+  const hasBearerLike = /^ya29\\.|^ya29-/.test(GOOGLE_AI_API_KEY) || GOOGLE_AI_API_KEY.startsWith("ya29");
+  const useBearer = hasBearerLike; // 如果是 OAuth-like token，使用 Bearer
+  const headers = { "Content-Type": "application/json" };
+  if (useBearer) headers["Authorization"] = `Bearer ${GOOGLE_AI_API_KEY}`;
+
+  // 如果不是 Bearer，會在 fallback 時把 ?key= 加上去（安全且常見）
+  const urlWithKey = useBearer ? baseUrl : `${baseUrl}?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+
+  // 最常用的 request body shape (contents)
+  const bodyContents = {
     contents: [
       {
         role: "user",
-        parts: [{ text: systemPrompt + "\n\n" + userText }],
+        parts: [{ text: (systemPrompt || "") + "\n\n" + (userText || "") }],
       },
     ],
   };
 
+  // Alternative body shapes (一些 project 回應格式不同時可用)
+  const altBodies = [
+    bodyContents,
+    // Chat-style messages (if model accepts chat-like input)
+    {
+      messages: [
+        { role: "system", content: [{ text: systemPrompt || "" }] },
+        { role: "user", content: [{ text: userText || "" }] },
+      ],
+    },
+    // "input" style (very small fallback)
+    { input: (systemPrompt || "") + "\n\n" + (userText || "") },
+  ];
+
   const maxRetry = 2;
   let attempt = 0;
 
-  while (attempt <= maxRetry) {
-    try {
-      const res = await axios.post(url, body, {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      });
+  // Try different body shapes if early attempts fail
+  for (let bodyIdx = 0; bodyIdx < altBodies.length; bodyIdx++) {
+    let body = altBodies[bodyIdx];
+    attempt = 0;
 
-      return res.data.candidates?.[0]?.content?.parts?.[0]?.text || "（模型無內容）";
-    } catch (err) {
-      attempt++;
+    while (attempt <= maxRetry) {
+      try {
+        const res = await axios.post(urlWithKey, body, {
+          headers,
+          timeout: 20000,
+        });
 
-      if (err.response?.status === 400 && userText.length > 500) {
-        userText = userText.slice(0, 400); // 自動縮短重新送
-        continue;
+        const data = res.data || {};
+        // 多種可能的回應 shape，逐一檢查
+        const candidateText =
+          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+          data?.candidates?.[0]?.content?.text ||
+          data?.output?.[0]?.content?.text ||
+          data?.outputs?.[0]?.candidates?.[0]?.content?.parts?.[0]?.text ||
+          data?.responses?.[0]?.items?.map?.((i) => i.text).join("\n") ||
+          data?.text ||
+          null;
+
+        if (candidateText) return String(candidateText);
+
+        // 如果沒拿到主要欄位，但 status success，回傳整個 data 簡短描述（不爆 key）
+        console.warn("Google AI returned success but no candidate text. response keys:", Object.keys(data));
+        return JSON.stringify(data).slice(0, 1500);
+      } catch (err) {
+        attempt++;
+
+        const status = err?.response?.status;
+        const respData = err?.response?.data;
+
+        // 特別處理 400：如果 body 太大或包含非法字符，先縮短 userText 再重試
+        if (status === 400 && (userText || "").length > 500) {
+          userText = userText.slice(0, 400);
+          // 如果 body 是 contents 型的，更新 body 方便下一輪重試
+          if (body.contents) body.contents[0].parts[0].text = (systemPrompt || "") + "\n\n" + userText;
+          continue;
+        }
+
+        // 特別處理 404：模型名稱可能錯誤 -> log model attempt
+        if (status === 404) {
+          console.error(`Google API 404 Not Found for model=${model}. Response:`, respData || err.message);
+          // don't immediately fail; try next body shape or let retry loop continue
+        }
+
+        // 若太多次仍失敗，break 並嘗試下一 body shape
+        if (attempt > maxRetry) {
+          console.error(
+            `askGoogleAI: failed (bodyIdx=${bodyIdx}) after ${attempt} attempts. status=${status}, err=${err.message}`
+          );
+          // 紀錄部分 response to logs, but 切勿印 API key
+          if (respData) console.error("Response data snippet:", JSON.stringify(respData).slice(0, 1000));
+          break;
+        }
+
+        // 簡單 backoff
+        await new Promise((r) => setTimeout(r, 400 * attempt));
       }
-
-      if (attempt > maxRetry) {
-        console.error("Google API failed after retries:", err.response?.data || err.message);
-        return "⚠️ 系統繁忙，請再試一次。";
-      }
-
-      await new Promise((r) => setTimeout(r, 500)); // 等 0.5 秒再重試
     }
+    // 下一個 body shape 繼續嘗試
   }
+
+  // 所有嘗試都失敗：回傳統一友善訊息
+  return "⚠️ AI 目前無回應（多次嘗試失敗）。請稍後再試或檢查 GOOGLE_AI_API_KEY / GOOGLE_AI_MODEL 設定。";
 }
+
 
 
 // Vision helper (unchanged structure but better errors)
