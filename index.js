@@ -1,15 +1,3 @@
-import crypto from "crypto";
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
-function verifyLineSignature(req, res, next) {
-  try {
-    const signature = req.get("x-line-signature") || "";
-    const body = JSON.stringify(req.body);
-    const hash = crypto.createHmac("sha256", LINE_CHANNEL_SECRET).update(body).digest("base64");
-    if (hash !== signature) return res.status(401).send("Invalid signature");
-    next();
-  } catch (e) { next(); }
-}
-app.post("/webhook", verifyLineSignature, async (req, res) => { ... });
 // index.upgraded.js
 // Upgraded LINE + Google Generative AI integration
 // - More robust Google AI caller (tries multiple payload shapes and header styles)
@@ -24,6 +12,21 @@ import dotenv from "dotenv";
 dotenv.config();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+import crypto from "crypto";
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
+function verifyLineSignature(req, res, next) {
+  try {
+    const signature = req.get("x-line-signature") || "";
+    const body = JSON.stringify(req.body);
+    const hash = crypto.createHmac("sha256", LINE_CHANNEL_SECRET).update(body).digest("base64");
+    if (hash !== signature) return res.status(401).send("Invalid signature");
+    next();
+  } catch (e) { next(); }
+}
+app.post("/webhook", verifyLineSignature, async (req, res) => { ... });
+
+
 // 在 index.js 靠近最上面（express app 建立後）加入：
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 // Env
