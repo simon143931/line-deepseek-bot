@@ -10,7 +10,6 @@ import axios from "axios";
 import dotenv from "dotenv";
 
 dotenv.config();
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 // 在 index.js 靠近最上面（express app 建立後）加入：
@@ -312,89 +311,51 @@ async function tryPost(url, body, headers = {}) {
   }
 }
 
-async function askGoogleAI(userText) {
-  if (!GOOGLE_AI_API_KEY) return "Google AI key 未設定，請先設定環境變數。";
+// ----🔧 Google AI API with Retry ----
+async function askGoogleAI(userText, systemPrompt) {
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
+    GOOGLE_AI_API_KEY;
 
-  // Candidate endpoints (keep trying sensible variants) - do NOT log full URLs with key
-  const base = "https://generativelanguage.googleapis.com";
-  const endpoints = [
-    `${base}/v1/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateText`,
-    `${base}/v1beta/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateText`,
-    `${base}/v1beta/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateContent`,
-    `${base}/v1/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generate`,
-  ];
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: systemPrompt + "\n\n" + userText }],
+      },
+    ],
+  };
 
-  // prepare candidate payload shapes (many Google client libs adapt these; we attempt multiple)
-  const userPrompt = systemPrompt + "\n\n下面是使用者的問題：\n\n" + userText;
+  const maxRetry = 2;
+  let attempt = 0;
 
-  const payloads = [
-    // simple prompt (older style)
-    { prompt: userPrompt },
-    // input object
-    { input: { text: userPrompt } },
-    // messages style (chat-like)
-    { messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userText }] },
-    // instances style (some endpoints accept instances)
-    { instances: [{ input: userPrompt }] },
-  ];
+  while (attempt <= maxRetry) {
+    try {
+      const res = await axios.post(url, body, {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
 
-  // Try with Authorization: Bearer first (preferred), then fallback to ?key in URL
-  const bearerHeaders = { Authorization: `Bearer ${GOOGLE_AI_API_KEY}` };
+      return res.data.candidates?.[0]?.content?.parts?.[0]?.text || "（模型無內容）";
+    } catch (err) {
+      attempt++;
 
-  let lastErr = null;
-  for (const url of endpoints) {
-    // 1) Try with Bearer header
-    for (const body of payloads) {
-      const { ok, res, err } = await tryPost(url, body, bearerHeaders);
-      if (ok) {
-        try {
-          // attempt to normalize different shapes
-          const d = res.data;
-          if (d && d.candidates && d.candidates.length) {
-            const parts = d.candidates[0].content?.parts || [];
-            return parts.map((p) => p.text || "").join("\n");
-          }
-          if (d?.output?.text) return d.output.text;
-          if (d?.response?.message) return d.response.message;
-          if (d?.responses && d.responses[0]) return JSON.stringify(d.responses[0]).slice(0, 2000);
-          return JSON.stringify(d).slice(0, 2000);
-        } catch (e) {
-          return `Google AI 返回但解析失敗：${e.message}`;
-        }
-      } else {
-        lastErr = err;
-        // continue trying
+      if (err.response?.status === 400 && userText.length > 500) {
+        userText = userText.slice(0, 400); // 自動縮短重新送
+        continue;
       }
-    }
 
-    // 2) Try same payloads with ?key= (some projects/API configurations expect this)
-    const urlWithKey = url + `?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
-    for (const body of payloads) {
-      const { ok, res, err } = await tryPost(urlWithKey, body, {});
-      if (ok) {
-        try {
-          const d = res.data;
-          if (d && d.candidates && d.candidates.length) {
-            const parts = d.candidates[0].content?.parts || [];
-            return parts.map((p) => p.text || "").join("\n");
-          }
-          if (d?.output?.text) return d.output.text;
-          if (d?.response?.message) return d.response.message;
-          if (d?.responses && d.responses[0]) return JSON.stringify(d.responses[0]).slice(0, 2000);
-          return JSON.stringify(d).slice(0, 2000);
-        } catch (e) {
-          return `Google AI 返回但解析失敗：${e.message}`;
-        }
-      } else {
-        lastErr = err;
+      if (attempt > maxRetry) {
+        console.error("Google API failed after retries:", err.response?.data || err.message);
+        return "⚠️ 系統繁忙，請再試一次。";
       }
+
+      await new Promise((r) => setTimeout(r, 500)); // 等 0.5 秒再重試
     }
   }
-
-  // final failure: give helpful logged error (without API key)
-  console.error("askGoogleAI all attempts failed. lastErr:", lastErr?.response?.status, lastErr?.response?.data || lastErr?.message);
-  return "呼叫 Google AI 失敗（請查看 server logs 取得詳細錯誤資訊）。";
 }
+
 
 // Vision helper (unchanged structure but better errors)
 async function analyzeImageWithVision(base64Image) {
