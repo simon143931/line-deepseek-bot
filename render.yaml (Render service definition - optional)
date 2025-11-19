@@ -1,0 +1,15 @@
+# render.yaml - for Render (optional)
+services:
+- type: web
+name: line-deepseek-bot
+env: node
+plan: free
+repo: https://github.com/YOUR/REPO
+buildCommand: "npm ci && npm run build || true"
+startCommand: "node index.upgraded.js"
+envVars:
+- key: GOOGLE_AI_API_KEY
+sync: false
+- key: LINE_CHANNEL_ACCESS_TOKEN
+sync: false
+healthCheckPath: /health
