@@ -10,7 +10,7 @@ import axios from "axios";
 import dotenv from "dotenv";
 
 dotenv.config();
-
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 // 在 index.js 靠近最上面（express app 建立後）加入：
