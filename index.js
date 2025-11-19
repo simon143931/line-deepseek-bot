@@ -11,7 +11,7 @@ app.use(express.json());
 // Env vars
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // 用來呼叫 Generative + Vision
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-1.5"; // 可改成 gemini-1.5-flash / gemini-2.5-flash 等
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5"; // 可改成 gemini-1.5-flash / gemini-2.5-flash 等
 
 if (!LINE_CHANNEL_ACCESS_TOKEN) {
   console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
