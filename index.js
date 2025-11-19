@@ -1,3 +1,4 @@
+// index.js
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -9,12 +10,18 @@ app.use(express.json());
 
 // Env vars
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
-const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY;
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // 用來呼叫 Generative + Vision
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-1.5"; // 可改成 gemini-1.5-flash / gemini-2.5-flash 等
+
+if (!LINE_CHANNEL_ACCESS_TOKEN) {
+  console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
+}
+if (!GOOGLE_AI_API_KEY) {
+  console.warn("Warning: GOOGLE_AI_API_KEY 未設定。");
+}
 
 // ====== 獵影策略 system prompt ======
-const systemPrompt = `
-你是一位專門教學「獵影策略」的交易教練 AGENT。
+const systemPrompt = `你是一位專門教學「獵影策略」的交易教練 AGENT。
 
 
 
@@ -172,7 +179,6 @@ D. 「風險評估與提醒」（例：如果 ATR 太小／已虧三單／趨勢
 
 
 
-
 ⚠️ 記住：使用者不需要懂策略、不需要學習。不管他說什麼，你都要幫他把獵影策略邏輯跑完，並主動提醒缺失與風險。你是他的策略保鑣。
 
 
@@ -281,117 +287,120 @@ D. 如果條件不符合：直接說明原因並建議觀望。
 
 ⚠️ 記住：無論使用者輸入多少或少，你都要做到「主動替他檢查」並給完整決策報告。`;
 
-// LINE Reply API helper
-async function replyToLine(replyToken, messages) {
+// ===== helper: reply to LINE =====
+async function replyToLine(replyToken, text) {
   const url = "https://api.line.me/v2/bot/message/reply";
-
-  await axios.post(
-    url,
-    {
-      replyToken,
-      messages,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-}
-
-// Fetch message content (image binary) from LINE and return base64
-async function fetchLineMessageContent(messageId) {
-  const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
-  const res = await axios.get(url, {
-    responseType: "arraybuffer",
-    headers: {
-      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-  });
-  const buffer = Buffer.from(res.data, "binary");
-  return buffer.toString("base64");
-}
-
-// Call Google Vision API (OCR + labels) using base64 image
-async function callGoogleVision(base64Image) {
-  const url = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`;
-  const body = {
-    requests: [
+  try {
+    await axios.post(
+      url,
       {
-        image: { content: base64Image },
-        features: [
-          { type: "TEXT_DETECTION", maxResults: 5 },
-          { type: "LABEL_DETECTION", maxResults: 10 },
-        ],
-      },
-    ],
-  };
-  const res = await axios.post(url, body, {
-    headers: { "Content-Type": "application/json" },
-  });
-  return res.data;
-}
-
-// Very small parser to extract trading-related keywords from OCR text
-function parseOcrForTrading(ocrText) {
-  if (!ocrText) return null;
-  const keywords = {
-    OBV: /OBV|On[- ]?Balance/i,
-    布林: /布林|Bollinger/i,
-    ATR: /ATR/i,
-    MA: /MA|移動平均/i,
-    十字星: /十字星|Doji/i,
-    吞沒: /吞沒|engulf/i,
-    影線: /影線|wick/i,
-    K棒: /K棒|K-?line|candl/i,
-  };
-
-  const found = {};
-  for (const k of Object.keys(keywords)) {
-    found[k] = keywords[k].test(ocrText);
-  }
-
-  // capture numbers (simple)
-  const numbers = Array.from(ocrText.matchAll(/[-+]?\d{1,3}(?:[,\.]\d+)?%?|\d+\.\d+/g)).map(m => m[0]);
-
-  return { found, numbers: numbers.slice(0, 20) };
-}
-
-// Google AI (Gemini) Chat API helper — attach OCR summary when available
-async function askGoogleAI(userText) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}`;
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [
+        replyToken,
+        messages: [
           {
-            text: systemPrompt + "\n\n下面是使用者的問題，請依照上面的獵影策略規則來回答：\n\n" + userText,
+            type: "text",
+            text,
           },
         ],
       },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (err) {
+    console.error("replyToLine error:", err.response?.data || err.message);
+  }
+}
+
+// ===== helper: try Google Generative API (robust) =====
+async function askGoogleAI(userText) {
+  if (!GOOGLE_AI_API_KEY) return "Google AI key 未設定，請先設定環境變數。";
+
+  // Build candidate endpoints in order (some projects / regions may require different paths)
+  const endpoints = [
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GOOGLE_AI_MODEL
+    )}:generateText?key=${GOOGLE_AI_API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GOOGLE_AI_MODEL
+    )}:generateContent?key=${GOOGLE_AI_API_KEY}`,
+    // fallback older style
+    `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(
+      GOOGLE_AI_MODEL
+    )}:generateText?key=${GOOGLE_AI_API_KEY}`,
+  ];
+
+  const body = {
+    // 用比較通用、簡潔的 payload（各 endpoint 可能有細微差別）
+    prompt: systemPrompt + "\n\n下面是使用者的問題：\n\n" + userText,
+    // 下面兩個欄位視 endpoint 支援情況自適應
+    // maxOutputTokens: 800,
+  };
+
+  let lastErr = null;
+  for (const url of endpoints) {
+    try {
+      const res = await axios.post(url, body, {
+        headers: { "Content-Type": "application/json" },
+      });
+
+      // Normalize different response shapes
+      if (res.data?.candidates?.length) {
+        const parts = res.data.candidates[0].content?.parts || [];
+        return parts.map((p) => p.text || "").join("\n");
+      }
+      if (res.data?.output?.text) {
+        return res.data.output.text;
+      }
+      if (res.data?.response) {
+        return JSON.stringify(res.data.response).slice(0, 2000);
+      }
+      // If nothing obvious, return raw data (truncated)
+      return JSON.stringify(res.data).slice(0, 2000);
+    } catch (err) {
+      lastErr = err;
+      // log details to help debugging
+      console.warn(`Google AI attempt failed for ${url}:`, err.response?.status, err.response?.data || err.message);
+      // try next endpoint
+    }
+  }
+  // all attempts failed
+  console.error("askGoogleAI all endpoints failed:", lastErr?.response?.data || lastErr?.message);
+  return "呼叫 Google AI 失敗（請查看 server logs 取得詳細錯誤資訊）。";
+}
+
+// ===== helper: call Google Vision annotate (OCR + labels) =====
+async function analyzeImageWithVision(base64Image) {
+  if (!GOOGLE_AI_API_KEY) return { error: "GOOGLE_AI_API_KEY 未設定" };
+
+  const url = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_AI_API_KEY}`;
+  const body = {
+    requests: [
+      {
+        image: {
+          content: base64Image,
+        },
+        features: [
+          { type: "TEXT_DETECTION", maxResults: 1 },
+          { type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 },
+          { type: "LABEL_DETECTION", maxResults: 5 },
+        ],
+      },
     ],
   };
 
-  const res = await axios.post(url, body, {
-    headers: { "Content-Type": "application/json" },
-  });
-
-  const candidates = res.data?.candidates;
-  if (!candidates || !candidates.length) {
-    return "Google AI 沒有回應內容，請稍後再試一次。";
+  try {
+    const res = await axios.post(url, body, { headers: { "Content-Type": "application/json" } });
+    return res.data;
+  } catch (err) {
+    console.error("Vision API error:", err.response?.data || err.message);
+    return { error: err.response?.data || err.message };
   }
-
-  const parts = candidates[0].content?.parts;
-  if (!parts || !parts.length) {
-    return "Google AI 回傳格式異常，請稍後再試一次。";
-  }
-
-  return parts.map((p) => p.text || "").join("\n");
 }
 
+// ===== webhook =====
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
 
@@ -401,56 +410,56 @@ app.post("/webhook", async (req, res) => {
       if (event.type !== "message") continue;
 
       const message = event.message;
-
       if (message.type === "text") {
         const userText = message.text;
         const answer = await askGoogleAI(userText);
-        await replyToLine(replyToken, [{ type: "text", text: answer.substring(0, 5000) }]);
-
+        await replyToLine(replyToken, answer.substring(0, 2000));
       } else if (message.type === "image") {
-        // PoC: download image -> Vision OCR -> parse -> call Gemini with OCR context
+        // 1) 先從 LINE 下載圖片 content
+        const messageId = message.id;
+        const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
+        let imgBase64 = null;
         try {
-          const messageId = message.id;
-          const base64 = await fetchLineMessageContent(messageId);
-          const visionRes = await callGoogleVision(base64);
-
-          const ocrText =
-            visionRes?.responses?.[0]?.fullTextAnnotation?.text ||
-            visionRes?.responses?.[0]?.textAnnotations?.[0]?.description ||
-            "";
-
-          const parsed = parseOcrForTrading(ocrText);
-
-          if (!ocrText) {
-            const fallbackText =
-              "我看不到圖中文字／指標，請用文字說明 OBV 與布林帶的位置（或再傳一張清楚的截圖）。";
-            await replyToLine(replyToken, [{ type: "text", text: fallbackText }]);
-            continue;
-          }
-
-          // build prompt for Gemini: include OCR + parsed summary
-          const prompt = `OCR 原文:\n${ocrText}\n\n自動解析關鍵字:\n${JSON.stringify(parsed, null, 2)}\n\n請依獵影策略格式，根據上面 OCR 與解析結果給出判斷與建議。`;
-
-          const answer = await askGoogleAI(prompt);
-
-          // reply with messages: OCR summary / parsed keywords / Gemini answer
-          const messages = [
-            { type: "text", text: `已辨識到的文字（截取）：\n${ocrText.substring(0, 1000)}` },
-            { type: "text", text: `自動解析結果：\n${Object.entries(parsed.found).filter(([, v]) => v).map(([k]) => k).join(", ") || "（未偵測到主要關鍵字）"}` },
-            { type: "text", text: `教練建議：\n${answer.substring(0, 3000)}` },
-          ];
-
-          await replyToLine(replyToken, messages);
-
-        } catch (e) {
-          console.error("Image handling error:", e?.response?.data || e.message || e);
-          await replyToLine(replyToken, [
-            { type: "text", text: "處理圖片時發生錯誤，請再傳一次或改以文字描述。" },
-          ]);
+          const imgRes = await axios.get(contentUrl, {
+            responseType: "arraybuffer",
+            headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+          });
+          const buffer = Buffer.from(imgRes.data, "binary");
+          imgBase64 = buffer.toString("base64");
+        } catch (err) {
+          console.error("Failed to download image from LINE:", err.response?.data || err.message);
+          await replyToLine(replyToken, "圖片下載失敗，請稍後再試。");
+          continue;
         }
+
+        // 2) 呼叫 Vision 做 OCR + label
+        const visionRes = await analyzeImageWithVision(imgBase64);
+        if (visionRes.error) {
+          await replyToLine(replyToken, "圖片辨識失敗（Vision API）。請查看 logs。");
+          continue;
+        }
+
+        // 3) 抽出 OCR 文字（若有）與 labels，作為 PoC 傳給 Google AI 請其依獵影策略判斷（注意：OCR 可能抓不到指標數值）
+        const textAnnotations =
+          visionRes.responses?.[0]?.textAnnotations?.[0]?.description || visionRes.responses?.[0]?.fullTextAnnotation?.text || "";
+        const labels = (visionRes.responses?.[0]?.labelAnnotations || []).map((l) => `${l.description}(${Math.round(l.score * 100)}%)`).join(", ");
+
+        // Build a concise prompt for the generative model using OCR result
+        let prompt = "我收到一張 K 線 / 指標截圖（PoC）。以下是 OCR 結果與 label：\n\n";
+        prompt += `OCR_text:\n${textAnnotations || "(無明確文字)"}\n\n`;
+        prompt += `Labels: ${labels || "(無)"}\n\n`;
+        prompt += "請嘗試依照獵影策略（只使用這些截圖中可見資訊）告訴我：\n1) 依可見資訊、這張圖是否可能為盤整行情（簡短理由）\n2) 若可以，指出需補上的三個最關鍵數據（例：OBV 相對 MA位置、ATR 值、K棒收盤價）\n\n（注意：這只是 PoC，OCR 未必能抓到所有指標，若資訊不足請回覆需要哪些數據。）";
+
+        const answer = await askGoogleAI(prompt);
+        const replyText = `PoC 圖片分析結果（OCR + Vision labels）：\n\nOCR 摘要: ${textAnnotations ? textAnnotations.substring(0, 800) : "(無)"}\nLabels: ${labels || "(無)"}\n\nAI 判斷（PoC）：\n${answer.substring(0, 1500)}`;
+
+        await replyToLine(replyToken, replyText);
+      } else {
+        // other message types
+        await replyToLine(replyToken, "目前只支援文字或圖片（PoC），其他類型暫不支援。");
       }
     } catch (err) {
-      console.error("Error processing event:", err);
+      console.error("Error processing event:", err.response?.data || err.message || err);
     }
   }
 
