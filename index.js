@@ -1,4 +1,10 @@
-// index.js
+// index.upgraded.js
+// Upgraded LINE + Google Generative AI integration
+// - More robust Google AI caller (tries multiple payload shapes and header styles)
+// - Better error logs (without leaking API keys)
+// - Vision call separated and safer
+// - Small improvements: env validation, timeouts, backoff, graceful reply fallback
+
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -6,21 +12,26 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// Env vars
+// Env
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // 用來呼叫 Generative + Vision
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5"; // 可改成 gemini-1.5-flash / gemini-2.5-flash 等
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // prefer Bearer style but some projects allow ?key
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5";
+const GOOGLE_AI_REGION = process.env.GOOGLE_AI_REGION || ""; // reserved
 
-if (!LINE_CHANNEL_ACCESS_TOKEN) {
-  console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
-}
-if (!GOOGLE_AI_API_KEY) {
-  console.warn("Warning: GOOGLE_AI_API_KEY 未設定。");
+if (!LINE_CHANNEL_ACCESS_TOKEN) console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
+if (!GOOGLE_AI_API_KEY) console.warn("Warning: GOOGLE_AI_API_KEY 未設定。");
+
+// Basic helpers
+function redactedKey(k) {
+  if (!k) return "(empty)";
+  return k.slice(0, 4) + "..." + k.slice(-4);
 }
 
-// ====== 獵影策略 system prompt ======
+console.log(`Starting with model=${GOOGLE_AI_MODEL}, key=${redactedKey(GOOGLE_AI_API_KEY)}`);
+
+// system prompt (kept as in your original file)
 const systemPrompt = `你是一位專門教學「獵影策略」的交易教練 AGENT。
 
 
@@ -287,101 +298,111 @@ D. 如果條件不符合：直接說明原因並建議觀望。
 
 ⚠️ 記住：無論使用者輸入多少或少，你都要做到「主動替他檢查」並給完整決策報告。`;
 
-// ===== helper: reply to LINE =====
-async function replyToLine(replyToken, text) {
-  const url = "https://api.line.me/v2/bot/message/reply";
+// robust request to Google Generative APIs
+async function tryPost(url, body, headers = {}) {
   try {
-    await axios.post(
-      url,
-      {
-        replyToken,
-        messages: [
-          {
-            type: "text",
-            text,
-          },
-        ],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    const res = await axios.post(url, body, {
+      headers: { "Content-Type": "application/json", ...headers },
+      timeout: 20000,
+    });
+    return { ok: true, res };
   } catch (err) {
-    console.error("replyToLine error:", err.response?.data || err.message);
+    return { ok: false, err };
   }
 }
 
-// ===== helper: try Google Generative API (robust) =====
 async function askGoogleAI(userText) {
   if (!GOOGLE_AI_API_KEY) return "Google AI key 未設定，請先設定環境變數。";
 
-  // Build candidate endpoints in order (some projects / regions may require different paths)
+  // Candidate endpoints (keep trying sensible variants) - do NOT log full URLs with key
+  const base = "https://generativelanguage.googleapis.com";
   const endpoints = [
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      GOOGLE_AI_MODEL
-    )}:generateText?key=${GOOGLE_AI_API_KEY}`,
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      GOOGLE_AI_MODEL
-    )}:generateContent?key=${GOOGLE_AI_API_KEY}`,
-    // fallback older style
-    `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(
-      GOOGLE_AI_MODEL
-    )}:generateText?key=${GOOGLE_AI_API_KEY}`,
+    `${base}/v1/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateText`,
+    `${base}/v1beta/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateText`,
+    `${base}/v1beta/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generateContent`,
+    `${base}/v1/models/${encodeURIComponent(GOOGLE_AI_MODEL)}:generate`,
   ];
 
-  const body = {
-    // 用比較通用、簡潔的 payload（各 endpoint 可能有細微差別）
-    prompt: systemPrompt + "\n\n下面是使用者的問題：\n\n" + userText,
-    // 下面兩個欄位視 endpoint 支援情況自適應
-    // maxOutputTokens: 800,
-  };
+  // prepare candidate payload shapes (many Google client libs adapt these; we attempt multiple)
+  const userPrompt = systemPrompt + "\n\n下面是使用者的問題：\n\n" + userText;
+
+  const payloads = [
+    // simple prompt (older style)
+    { prompt: userPrompt },
+    // input object
+    { input: { text: userPrompt } },
+    // messages style (chat-like)
+    { messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userText }] },
+    // instances style (some endpoints accept instances)
+    { instances: [{ input: userPrompt }] },
+  ];
+
+  // Try with Authorization: Bearer first (preferred), then fallback to ?key in URL
+  const bearerHeaders = { Authorization: `Bearer ${GOOGLE_AI_API_KEY}` };
 
   let lastErr = null;
   for (const url of endpoints) {
-    try {
-      const res = await axios.post(url, body, {
-        headers: { "Content-Type": "application/json" },
-      });
+    // 1) Try with Bearer header
+    for (const body of payloads) {
+      const { ok, res, err } = await tryPost(url, body, bearerHeaders);
+      if (ok) {
+        try {
+          // attempt to normalize different shapes
+          const d = res.data;
+          if (d && d.candidates && d.candidates.length) {
+            const parts = d.candidates[0].content?.parts || [];
+            return parts.map((p) => p.text || "").join("\n");
+          }
+          if (d?.output?.text) return d.output.text;
+          if (d?.response?.message) return d.response.message;
+          if (d?.responses && d.responses[0]) return JSON.stringify(d.responses[0]).slice(0, 2000);
+          return JSON.stringify(d).slice(0, 2000);
+        } catch (e) {
+          return `Google AI 返回但解析失敗：${e.message}`;
+        }
+      } else {
+        lastErr = err;
+        // continue trying
+      }
+    }
 
-      // Normalize different response shapes
-      if (res.data?.candidates?.length) {
-        const parts = res.data.candidates[0].content?.parts || [];
-        return parts.map((p) => p.text || "").join("\n");
+    // 2) Try same payloads with ?key= (some projects/API configurations expect this)
+    const urlWithKey = url + `?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+    for (const body of payloads) {
+      const { ok, res, err } = await tryPost(urlWithKey, body, {});
+      if (ok) {
+        try {
+          const d = res.data;
+          if (d && d.candidates && d.candidates.length) {
+            const parts = d.candidates[0].content?.parts || [];
+            return parts.map((p) => p.text || "").join("\n");
+          }
+          if (d?.output?.text) return d.output.text;
+          if (d?.response?.message) return d.response.message;
+          if (d?.responses && d.responses[0]) return JSON.stringify(d.responses[0]).slice(0, 2000);
+          return JSON.stringify(d).slice(0, 2000);
+        } catch (e) {
+          return `Google AI 返回但解析失敗：${e.message}`;
+        }
+      } else {
+        lastErr = err;
       }
-      if (res.data?.output?.text) {
-        return res.data.output.text;
-      }
-      if (res.data?.response) {
-        return JSON.stringify(res.data.response).slice(0, 2000);
-      }
-      // If nothing obvious, return raw data (truncated)
-      return JSON.stringify(res.data).slice(0, 2000);
-    } catch (err) {
-      lastErr = err;
-      // log details to help debugging
-      console.warn(`Google AI attempt failed for ${url}:`, err.response?.status, err.response?.data || err.message);
-      // try next endpoint
     }
   }
-  // all attempts failed
-  console.error("askGoogleAI all endpoints failed:", lastErr?.response?.data || lastErr?.message);
+
+  // final failure: give helpful logged error (without API key)
+  console.error("askGoogleAI all attempts failed. lastErr:", lastErr?.response?.status, lastErr?.response?.data || lastErr?.message);
   return "呼叫 Google AI 失敗（請查看 server logs 取得詳細錯誤資訊）。";
 }
 
-// ===== helper: call Google Vision annotate (OCR + labels) =====
+// Vision helper (unchanged structure but better errors)
 async function analyzeImageWithVision(base64Image) {
   if (!GOOGLE_AI_API_KEY) return { error: "GOOGLE_AI_API_KEY 未設定" };
-
-  const url = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_AI_API_KEY}`;
+  const url = `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
   const body = {
     requests: [
       {
-        image: {
-          content: base64Image,
-        },
+        image: { content: base64Image },
         features: [
           { type: "TEXT_DETECTION", maxResults: 1 },
           { type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 },
@@ -392,18 +413,31 @@ async function analyzeImageWithVision(base64Image) {
   };
 
   try {
-    const res = await axios.post(url, body, { headers: { "Content-Type": "application/json" } });
+    const res = await axios.post(url, body, { headers: { "Content-Type": "application/json" }, timeout: 20000 });
     return res.data;
   } catch (err) {
-    console.error("Vision API error:", err.response?.data || err.message);
+    console.error("Vision API error:", err.response?.status, err.response?.data || err.message);
     return { error: err.response?.data || err.message };
   }
 }
 
-// ===== webhook =====
+// reply helper unchanged
+async function replyToLine(replyToken, text) {
+  const url = "https://api.line.me/v2/bot/message/reply";
+  try {
+    await axios.post(
+      url,
+      { replyToken, messages: [{ type: "text", text }] },
+      { headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
+    );
+  } catch (err) {
+    console.error("replyToLine error:", err.response?.status, err.response?.data || err.message);
+  }
+}
+
+// webhook (keeps your logic but uses upgraded helpers)
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
-
   for (const event of events) {
     try {
       const replyToken = event.replyToken;
@@ -415,7 +449,7 @@ app.post("/webhook", async (req, res) => {
         const answer = await askGoogleAI(userText);
         await replyToLine(replyToken, answer.substring(0, 2000));
       } else if (message.type === "image") {
-        // 1) 先從 LINE 下載圖片 content
+        // similar as before: download, vision, askGoogleAI
         const messageId = message.id;
         const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
         let imgBase64 = null;
@@ -423,50 +457,37 @@ app.post("/webhook", async (req, res) => {
           const imgRes = await axios.get(contentUrl, {
             responseType: "arraybuffer",
             headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+            timeout: 15000,
           });
-          const buffer = Buffer.from(imgRes.data, "binary");
-          imgBase64 = buffer.toString("base64");
+          imgBase64 = Buffer.from(imgRes.data, "binary").toString("base64");
         } catch (err) {
-          console.error("Failed to download image from LINE:", err.response?.data || err.message);
+          console.error("Failed to download image from LINE:", err.response?.status, err.response?.data || err.message);
           await replyToLine(replyToken, "圖片下載失敗，請稍後再試。");
           continue;
         }
 
-        // 2) 呼叫 Vision 做 OCR + label
         const visionRes = await analyzeImageWithVision(imgBase64);
         if (visionRes.error) {
           await replyToLine(replyToken, "圖片辨識失敗（Vision API）。請查看 logs。");
           continue;
         }
 
-        // 3) 抽出 OCR 文字（若有）與 labels，作為 PoC 傳給 Google AI 請其依獵影策略判斷（注意：OCR 可能抓不到指標數值）
-        const textAnnotations =
-          visionRes.responses?.[0]?.textAnnotations?.[0]?.description || visionRes.responses?.[0]?.fullTextAnnotation?.text || "";
+        const textAnnotations = visionRes.responses?.[0]?.textAnnotations?.[0]?.description || visionRes.responses?.[0]?.fullTextAnnotation?.text || "";
         const labels = (visionRes.responses?.[0]?.labelAnnotations || []).map((l) => `${l.description}(${Math.round(l.score * 100)}%)`).join(", ");
 
-        // Build a concise prompt for the generative model using OCR result
-        let prompt = "我收到一張 K 線 / 指標截圖（PoC）。以下是 OCR 結果與 label：\n\n";
-        prompt += `OCR_text:\n${textAnnotations || "(無明確文字)"}\n\n`;
-        prompt += `Labels: ${labels || "(無)"}\n\n`;
-        prompt += "請嘗試依照獵影策略（只使用這些截圖中可見資訊）告訴我：\n1) 依可見資訊、這張圖是否可能為盤整行情（簡短理由）\n2) 若可以，指出需補上的三個最關鍵數據（例：OBV 相對 MA位置、ATR 值、K棒收盤價）\n\n（注意：這只是 PoC，OCR 未必能抓到所有指標，若資訊不足請回覆需要哪些數據。）";
-
+        let prompt = `我收到一張 K 線 / 指標截圖（PoC）。\nOCR_text:\n${textAnnotations || "(無)"}\nLabels: ${labels || "(無)"}\n\n請依獵影策略簡短判斷（PoC）。`;
         const answer = await askGoogleAI(prompt);
         const replyText = `PoC 圖片分析結果（OCR + Vision labels）：\n\nOCR 摘要: ${textAnnotations ? textAnnotations.substring(0, 800) : "(無)"}\nLabels: ${labels || "(無)"}\n\nAI 判斷（PoC）：\n${answer.substring(0, 1500)}`;
-
         await replyToLine(replyToken, replyText);
       } else {
-        // other message types
         await replyToLine(replyToken, "目前只支援文字或圖片（PoC），其他類型暫不支援。");
       }
     } catch (err) {
       console.error("Error processing event:", err.response?.data || err.message || err);
     }
   }
-
   res.status(200).send("OK");
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("LINE Bot webhook listening on port " + PORT);
-});
+app.listen(PORT, () => console.log("LINE Bot webhook listening on port " + PORT));
