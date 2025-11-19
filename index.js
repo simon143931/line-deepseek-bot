@@ -1,3 +1,4 @@
+// index.js (修改版 - 含圖片 PoC)
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -8,11 +9,11 @@ app.use(express.json());
 
 // Env vars
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // 你原本的 Gemini key (保留)
+const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY; // 新增：Vision key
 
 // ====== 獵影策略 system prompt ======
-const systemPrompt = `
-你是一位專門教學「獵影策略」的交易教練 AGENT。
+const systemPrompt = `你是一位專門教學「獵影策略」的交易教練 AGENT。
 
 【你的唯一參考聖經】
 - 以使用者提供的《獵影策略》PDF 為最高優先依據。
@@ -133,13 +134,11 @@ const systemPrompt = `
    - 列出缺少的關鍵資訊，例如 ATR 數字、截圖時間週期等。
    - 用友好語氣請使用者補充，而不是拒絕回答。
 
-⚠️ 記住：無論使用者輸入多少或少，你都要做到「主動替他檢查」並給完整決策報告。
-`;
+⚠️ 記住：無論使用者輸入多少或少，你都要做到「主動替他檢查」並給完整決策報告。`;
 
 // LINE Reply API helper
 async function replyToLine(replyToken, text) {
   const url = "https://api.line.me/v2/bot/message/reply";
-
   await axios.post(
     url,
     {
@@ -160,21 +159,16 @@ async function replyToLine(replyToken, text) {
   );
 }
 
-// Google AI (Gemini) Chat API helper
+// Google AI (Gemini) Chat API helper - 保留你原本的 askGoogleAI（若需我也可以改用新版 SDK）
 async function askGoogleAI(userText) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}`;
-
   const body = {
     contents: [
       {
         role: "user",
         parts: [
           {
-            text:
-              systemPrompt +
-              "\n\n下面是使用者的問題，請依照上面的獵影策略規則來回答：" +
-              "\n\n" +
-              userText,
+            text: systemPrompt + "\n\n下面是使用者的問題，請依照上面的獵影策略規則來回答：\n\n" + userText,
           },
         ],
       },
@@ -197,8 +191,108 @@ async function askGoogleAI(userText) {
     return "Google AI 回傳格式異常，請稍後再試一次。";
   }
 
-  // 把所有文字 parts 接起來
   return parts.map((p) => p.text || "").join("\n");
+}
+
+/**
+ * 下載 LINE image content（回傳 base64 string）
+ * 需要環境變數 LINE_CHANNEL_ACCESS_TOKEN
+ */
+async function fetchLineMessageContent(messageId) {
+  const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
+  const res = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: {
+      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+  });
+  const buffer = Buffer.from(res.data, "binary");
+  const base64 = buffer.toString("base64");
+  return base64;
+}
+
+/**
+ * 呼叫 Google Vision images:annotate 做初步 OCR + label 檢測
+ * 回傳簡單的分析物件 { ocrText: string|null, labels: string[], summary: string }
+ */
+async function analyzeImageWithVision(base64Image) {
+  if (!GOOGLE_VISION_API_KEY) {
+    throw new Error("GOOGLE_VISION_API_KEY 未設定，請在環境變數設定它。");
+  }
+
+  const url = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`;
+  const body = {
+    requests: [
+      {
+        image: { content: base64Image },
+        features: [
+          { type: "TEXT_DETECTION", maxResults: 5 },
+          { type: "LABEL_DETECTION", maxResults: 5 },
+        ],
+      },
+    ],
+  };
+
+  const res = await axios.post(url, body, {
+    headers: { "Content-Type": "application/json" },
+    timeout: 15000,
+  });
+
+  const r = res.data.responses && res.data.responses[0] ? res.data.responses[0] : {};
+  const ocrText = (r.fullTextAnnotation && r.fullTextAnnotation.text) || (r.textAnnotations && r.textAnnotations[0] && r.textAnnotations[0].description) || "";
+  const labels = (r.labelAnnotations || []).map((l) => l.description);
+
+  // 簡單關鍵字判斷（PoC）
+  const keywords = [];
+  const textLower = ocrText ? ocrText.toLowerCase() : "";
+  if (/obv|on-balance|on balance/i.test(ocrText)) keywords.push("OBV");
+  if (/bollin|bollinger|布林/i.test(ocrText)) keywords.push("Bollinger");
+  if (/atr/i.test(ocrText)) keywords.push("ATR");
+  if (/ma\b|moving average|均線|移動平均/i.test(ocrText)) keywords.push("MA");
+  if (/k棒|k線|candl/i.test(ocrText)) keywords.push("K棒/燭台");
+
+  // 嘗試抓出數字（簡單）
+  const numbers = [];
+  const numMatches = textLower.match(/-?\d+(\.\d+)?%?/g);
+  if (numMatches) {
+    for (const n of numMatches) {
+      numbers.push(n);
+      if (numbers.length >= 8) break;
+    }
+  }
+
+  // 構造 summary（友善可讀）
+  let summary = "";
+  if (keywords.length > 0) {
+    summary += `我在圖片的文字中找到可能相關的關鍵字：${keywords.join("、")}。\n`;
+  } else {
+    summary += "在圖片中沒有直接找到 OBV / 布林 / ATR 等關鍵字（或 OCR 無法辨識）。\n";
+  }
+
+  if (numbers.length > 0) {
+    summary += `圖片中偵測到的數值範例：${numbers.slice(0,5).join(", ")}。\n`;
+  }
+
+  if (labels && labels.length) {
+    summary += `Vision Label 偵測到：${labels.slice(0,5).join(", ")}。\n`;
+  }
+
+  // PoC 的建議：如果有關鍵字就嘗試自動判斷，若沒有則回傳 fallback 操作指示
+  let actionable = "";
+  if (keywords.length > 0) {
+    actionable += "依目前抓到的文字，我會嘗試根據你傳的訊息來做進一步判斷（若要我直接判斷，請同時提供時間週期與 ATR 值）。";
+  } else {
+    actionable += "自動解析目前仍不穩定。你可以用文字補充：\n- OBV 現在相對 MA 在「上/下」嗎？\n- 當前 K 棒有沒有長影線或吞沒？\n- ATR（或停損距離）約多少？\n我就會用獵影策略幫你完整判斷。";
+  }
+
+  return {
+    ocrText,
+    labels,
+    keywords,
+    numbers,
+    summary,
+    actionable,
+  };
 }
 
 app.post("/webhook", async (req, res) => {
@@ -207,9 +301,7 @@ app.post("/webhook", async (req, res) => {
   for (const event of events) {
     try {
       const replyToken = event.replyToken;
-
       if (event.type !== "message") continue;
-
       const message = event.message;
 
       if (message.type === "text") {
@@ -217,9 +309,25 @@ app.post("/webhook", async (req, res) => {
         const answer = await askGoogleAI(userText);
         await replyToLine(replyToken, answer.substring(0, 1000));
       } else if (message.type === "image") {
-        const fallbackText =
-          "目前這個 LINE Bot 暫時只支援文字描述。請你用文字簡單說明 OBV、布林帶、K 棒形狀，我再依獵影策略幫你判斷。";
-        await replyToLine(replyToken, fallbackText);
+        // PoC: 下載圖片、丟給 Vision，並回覆一段「初步解析」
+        try {
+          const messageId = message.id;
+          const base64 = await fetchLineMessageContent(messageId);
+          const analysis = await analyzeImageWithVision(base64);
+
+          // 組成回覆文字（保持短、清楚）
+          let reply = "📷 已收到圖片，這是初步解析結果：\n\n";
+          reply += analysis.summary + "\n";
+          reply += analysis.actionable;
+
+          await replyToLine(replyToken, reply.substring(0, 2000));
+        } catch (imgErr) {
+          console.error("Image processing error:", imgErr);
+          await replyToLine(
+            replyToken,
+            "圖片解析發生錯誤，請稍後再試或改用文字描述（例如：OBV 在 MA 上方/下方、K棒是否吞沒等）。"
+          );
+        }
       }
     } catch (err) {
       console.error("Error processing event:", err);
