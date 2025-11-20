@@ -23,7 +23,7 @@ const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY; // 通常用 ?key= 方式
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-flash";
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5";
 const GOOGLE_AI_REGION = process.env.GOOGLE_AI_REGION || ""; // 保留欄位
 
 // trades.json 路徑
