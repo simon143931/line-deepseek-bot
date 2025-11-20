@@ -29,7 +29,7 @@ app.get("/health", (req, res) => {
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5";
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-pro";
 
 if (!LINE_CHANNEL_ACCESS_TOKEN) console.warn("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定");
 if (!LINE_CHANNEL_SECRET) console.warn("⚠️ LINE_CHANNEL_SECRET 未設定(將無法驗簽)");
