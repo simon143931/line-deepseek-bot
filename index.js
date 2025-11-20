@@ -31,8 +31,8 @@ const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY || "";
 const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-flash"; // 你可以在 .env 改
 const TRADINGVIEW_WEBHOOK_SECRET =
-  process.env.TRADINGVIEW_WEBHOOK_SECRET || "";
-const TRADINGVIEW_PUSH_TO = process.env.TRADINGVIEW_PUSH_TO || ""; // 要推播到的 userId 或 groupId
+  process.env.TRADINGVIEW_WEBHOOK_SECRET || "Mnsn143931_1314";
+const TRADINGVIEW_PUSH_TO = process.env.TRADINGVIEW_PUSH_TO || "jokeronyou"; // 要推播到的 userId 或 groupId
 
 function redactedKey(k) {
   if (!k) return "(empty)";
