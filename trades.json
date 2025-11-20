@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "created_at": "2025-11-20T00:00:00Z",
+  "trades": [],
+  "stats": {
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0,
+    "last_3_results": [],
+    "consecutive_losses": 0
+  }
+}
