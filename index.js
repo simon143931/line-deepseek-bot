@@ -23,7 +23,7 @@ const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-1.5-flash";
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-flash";
 
 if (!LINE_CHANNEL_ACCESS_TOKEN) {
   console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
