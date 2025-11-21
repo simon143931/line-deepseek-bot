@@ -1,13 +1,54 @@
-{
-  "version": "1.0",
-  "created_at": "2025-11-20T00:00:00Z",
-  "trades": [],
-  "stats": {
-    "total_trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "win_rate": 0,
-    "last_3_results": [],
-    "consecutive_losses": 0
+// ---------------------- trades.json 簡易交易日誌 ----------------------
+const TRADES_FILE = path.join(process.cwd(), "trades.json");
+
+function ensureTradesFile() {
+  try {
+    if (!fs.existsSync(TRADES_FILE)) {
+      fs.writeFileSync(TRADES_FILE, "[]", "utf8");
+    }
+  } catch (e) {
+    console.error("確保 trades.json 存在時發生錯誤:", e.message);
   }
+}
+
+function loadTrades() {
+  try {
+    ensureTradesFile();
+    const raw = fs.readFileSync(TRADES_FILE, "utf8").trim();
+    if (!raw) return [];
+
+    const data = JSON.parse(raw);
+
+    // 如果內容不是陣列（例如 {} 或其他亂格式），自動重置成 []
+    if (!Array.isArray(data)) {
+      console.warn("trades.json 格式不是陣列，已自動重置為 []");
+      saveTrades([]);
+      return [];
+    }
+
+    return data;
+  } catch (e) {
+    console.error("讀取 trades.json 失敗:", e.message);
+    return [];
+  }
+}
+
+function saveTrades(trades) {
+  try {
+    const arr = Array.isArray(trades) ? trades : [];
+    fs.writeFileSync(TRADES_FILE, JSON.stringify(arr, null, 2), "utf8");
+  } catch (e) {
+    console.error("寫入 trades.json 失敗:", e.message);
+  }
+}
+
+function appendTrade(note) {
+  const trades = loadTrades();
+  const arr = Array.isArray(trades) ? trades : [];
+  arr.push({
+    id: arr.length + 1,
+    time: new Date().toISOString(),
+    note,
+  });
+  saveTrades(arr);
 }
