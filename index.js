@@ -1,10 +1,10 @@
 // index.js
-// 升級版：LINE Bot + Google Generative AI + Vision + 交易日誌(trades.json)
+// LINE + Google Gemini (文字 + 圖片) + 簡易交易日誌(trades.json)
 
-// ================== Imports & 初始化 ==================
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -13,63 +13,40 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// 健康檢查，方便 Render / 你自己測試
+// ---------------------- Health Check ----------------------
 app.get("/health", (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// ================== Env 設定 ==================
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
+// ---------------------- Env & 基本設定 ----------------------
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY || "";
-const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-flash"; // 預設穩定款
+
+const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
+const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-1.5-flash";
 
 if (!LINE_CHANNEL_ACCESS_TOKEN) {
   console.warn("Warning: LINE_CHANNEL_ACCESS_TOKEN 未設定。");
 }
+if (!LINE_CHANNEL_SECRET) {
+  console.warn("Warning: LINE_CHANNEL_SECRET 未設定，webhook 驗證將失效。");
+}
 if (!GOOGLE_AI_API_KEY) {
-  console.warn("Warning: GOOGLE_AI_API_KEY 未設定。");
+  console.warn("Warning: GOOGLE_AI_API_KEY 未設定，AI 功能無法使用。");
 }
 
-// key 打 log 會遮一部分，避免外流
-function redactedKey(k) {
+function redactKey(k) {
   if (!k) return "(empty)";
-  if (k.length <= 8) return "******";
+  if (k.length <= 8) return "****";
   return k.slice(0, 4) + "..." + k.slice(-4);
 }
-
 console.log(
-  `Starting LINE bot with model=${GOOGLE_AI_MODEL}, GOOGLE_AI_API_KEY=${redactedKey(
+  `[BOOT] model=${GOOGLE_AI_MODEL}, googleKey=${redactKey(
     GOOGLE_AI_API_KEY
   )}`
 );
 
-// ================== 可選：LINE 簽名驗證（目前沒啟用） ==================
-// 如果未來想啟用高安全驗證，可以改用 raw body 版本。
-// 先留在這裡給你當範本，但目前沒有掛在 app.post 上。
-/*
-import crypto from "crypto";
-function verifyLineSignature(req, res, next) {
-  try {
-    const signature = req.get("x-line-signature") || "";
-    const body = JSON.stringify(req.body);
-    const hash = crypto
-      .createHmac("sha256", LINE_CHANNEL_SECRET)
-      .update(body)
-      .digest("base64");
-    if (hash !== signature) {
-      console.warn("Invalid LINE signature");
-      return res.status(401).send("Invalid signature");
-    }
-    next();
-  } catch (e) {
-    console.error("verifyLineSignature error:", e);
-    next(); // 不要因為這裡炸掉整個 webhook
-  }
-}
-*/
-
-// ================== System Prompt（獵影策略教練） ==================
+// ---------------------- 系統 Prompt（獵影策略教練） ----------------------
 const systemPrompt = `你是一位專門教學「獵影策略」的交易教練 AGENT。
 
 【你的唯一參考聖經】
@@ -121,33 +98,21 @@ B. 如果適用，逐步拆解：
 C. 如果不適用，直接說明為何不適用，並提醒使用者最好空手觀望。
 
 3. 如果使用者只問「能不能進場？」或給你一句不完整的描述，你要：
-
 (1) 先主動幫使用者檢查以下四件關鍵事：
-- 現在是否為盤整行情？（依 OBV + 布林帶規則）
-- 有沒有符合三種 K 棒進場型態之一？（十字星、實體吞沒、影線吞沒）
-- ATR 的距離有沒有足夠風險收益比？（至少 1R 以上）
-- 有沒有連虧三單、應該暫停交易？
-
+  - 現在是否為盤整行情？（依 OBV + 布林帶規則）
+  - 有沒有符合三種 K 棒進場型態之一？（十字星、實體吞沒、影線吞沒）
+  - ATR 的距離有沒有足夠風險收益比？（至少 1R 以上）
+  - 有沒有連虧三單、應該暫停交易？
 (2) 如果使用者資訊不夠，請主動告訴他：
-- 「你還缺少哪幾個資訊，才有辦法正確判斷」
-- 用最簡單、易懂的形式引導他補充，例如：
-  - 「你還沒告訴我 OBV 現在相對 MA 的位置哦，我需要知道這點才能判斷是不是盤整。」
-  - 「你可以只告訴我：這根 K 棒是不是長影線 / 吞沒前一根？」
-
+  - 你還缺少哪幾個資訊，才有辦法正確判斷
+  - 用最簡單、易懂的形式引導他補充。
 (3) 當所有條件齊備後，你要主動完整輸出以下決策報告：
-A. 「此盤勢是否符合盤整？」（是／否 + 判斷依據）
-B. 「是否符合三種進場型態之一？」（是哪一種＋理由）
-C. 「建議進場價格、停損位置（用 ATR 估計）、1R、1.5R 停利點」
-D. 「風險評估與提醒」（例：如果 ATR 太小／已虧三單／趨勢走強，應建議觀望）
-
-(4) 如果所有條件不成立，你要直接講：
-- 「這不是獵影策略該進場的位置，建議觀望。」並幫他講清楚原因。
-
-⚠️ 記住：使用者不需要懂策略、不需要學習。不管他說什麼，你都要幫他把獵影策略邏輯跑完，並主動提醒缺失與風險。你是他的策略保鑣。
-
-4. 如果使用者問的是「觀念問題」（例：什麼是十字星？為什麼要等收盤？）：
-- 你要用生活化比喻、分點解釋，讓「交易小白」也能看懂。
-- 可以舉《獵影策略》中的段落做解釋，但不要長篇照抄，改用自己的話。
+  A. 「此盤勢是否符合盤整？」（是／否 + 判斷依據）
+  B. 「是否符合三種進場型態之一？」（是哪一種＋理由）
+  C. 「建議進場價格、停損位置（用 ATR 估計）、1R、1.5R 停利點」
+  D. 「風險評估與提醒」。
+(4) 如果所有條件不成立，你要直接說：
+  - 「這不是獵影策略該進場的位置，建議觀望。」並幫他講清楚原因。
 
 5. 用風險警示保護使用者：
 - 你不能保證獲利，只能說「根據這個策略，理論上該怎麼做」。
@@ -162,176 +127,104 @@ D. 「風險評估與提醒」（例：如果 ATR 太小／已虧三單／趨勢
   4. 有沒有合理的停損位置與 1~1.5R 停利位置？
 
 - 如果使用者的描述不足以判斷，你要告訴他：
-  - 你還缺「哪幾個關鍵資訊」（例如：OBV 相對 MA 的位置、影線是否超過前一根、ATR 數值等）。
+  - 你還缺「哪幾個關鍵資訊」。
   - 再請他補充數據或更清楚的描述，而不是亂猜。
 
 【圖片識別邏輯】
-如果使用者傳來圖片（如 K 線截圖、OBV + 布林圖），你要：
+- 如果使用者傳來圖片（如 K 線截圖、OBV + 布林圖），你要依照獵影策略流程，主動做盤整判斷、進場條件檢查與風險提示。`;
 
-1. 直接解析圖片內容，包括：
-- OBV 與 MA 相對位置
-- OBV 與布林帶相對位置（突破 / 收回 / 毫無接觸）
-- 當前 K 棒是否為：十字星 / 實體吞沒 / 影線吞沒 / 都不是
-- ATR 位置如有顯示，幫忙估算停損距離
-- 有沒有超過 3 根連續止損（如果能識別）
+// ---------------------- trades.json 簡易交易日誌 ----------------------
+const TRADES_FILE = path.join(process.cwd(), "trades.json");
 
-2. 依照獵影策略流程主動執行：
-A. 判斷這是否為盤整行情（如果不是，直接說建議觀察）
-B. 判斷有沒有出現策略中的進場型態
-C. 如果進場條件符合：
-- 建議進場方向（做多 / 做空）
-- 建議進場價格（可依 K 棒型態決定市價或掛單）
-- 建議停損價格（用 ATR 或影線為基礎）
-- 計算 1R 和 1.5R 的停利價格
-D. 如果條件不符合：直接說明原因並建議觀望。
+function ensureTradesFile() {
+  try {
+    if (!fs.existsSync(TRADES_FILE)) {
+      fs.writeFileSync(TRADES_FILE, "[]", "utf8");
+    }
+  } catch (e) {
+    console.error("確保 trades.json 存在時發生錯誤:", e.message);
+  }
+}
 
-3. 如果圖片資訊不足以自動做決策，你要：
-- 列出缺少的關鍵資訊，例如 ATR 數字、截圖時間週期等。
-- 用友好語氣請使用者補充，而不是拒絕回答。
+function loadTrades() {
+  try {
+    ensureTradesFile();
+    const raw = fs.readFileSync(TRADES_FILE, "utf8");
+    return JSON.parse(raw || "[]");
+  } catch (e) {
+    console.error("讀取 trades.json 失敗:", e.message);
+    return [];
+  }
+}
 
-⚠️ 記住：無論使用者輸入多少或少，你都要做到「主動替他檢查」並給完整決策報告。`;
+function saveTrades(trades) {
+  try {
+    fs.writeFileSync(TRADES_FILE, JSON.stringify(trades, null, 2), "utf8");
+  } catch (e) {
+    console.error("寫入 trades.json 失敗:", e.message);
+  }
+}
 
-// ================== Google AI Caller（含重試 & 多種 body 型態） ==================
-async function askGoogleAI(userText, overrideSystemPrompt = "") {
+function appendTrade(note) {
+  const trades = loadTrades();
+  trades.push({
+    id: trades.length + 1,
+    time: new Date().toISOString(),
+    note,
+  });
+  saveTrades(trades);
+}
+
+function formatRecentTrades(limit = 5) {
+  const trades = loadTrades();
+  if (!trades.length) return "目前還沒有任何交易紀錄。";
+
+  const recent = trades.slice(-limit);
+  return (
+    "以下是最近幾筆交易紀錄：\n" +
+    recent
+      .map(
+        (t) =>
+          `#${t.id} - ${t.time}\n${t.note}\n------------------------`
+      )
+      .join("\n")
+  );
+}
+
+// ---------------------- Google Gemini (文字 + 圖片) ----------------------
+async function askGoogleAI(userText, options = {}) {
   if (!GOOGLE_AI_API_KEY) {
-    console.error("Missing GOOGLE_AI_API_KEY");
     return "⚠️ 系統設定錯誤：AI 金鑰未設定，請聯絡管理員。";
   }
 
+  const { imageBase64, imageMimeType } = options;
+
   const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
-  const baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
-  )}:generateContent`;
+  )}:generateContent?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
 
-  const headers = { "Content-Type": "application/json" };
-  // 這裡假設你是用 API Key，而不是 OAuth Bearer
-  const urlWithKey = `${baseUrl}?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+  const parts = [];
 
-  const fullPrompt =
-    (overrideSystemPrompt || systemPrompt || "") +
-    "\n\n" +
-    (userText || "");
+  // 把獵影策略 systemPrompt + 使用者問題一起丟給模型
+  parts.push({
+    text: `${systemPrompt}\n\n【使用者的問題／情境】\n${userText || ""}`,
+  });
 
-  // 最常用 body（官方 docs 的 contents 格式）
-  const bodyContents = {
+  if (imageBase64) {
+    parts.push({
+      inlineData: {
+        mimeType: imageMimeType || "image/jpeg",
+        data: imageBase64,
+      },
+    });
+  }
+
+  const body = {
     contents: [
       {
         role: "user",
-        parts: [{ text: fullPrompt }],
-      },
-    ],
-  };
-
-  // 幾個備用格式（有些 project / 未來版本回應 shape 不同，可以救一命）
-  const altBodies = [
-    bodyContents,
-    {
-      // 類 chat messages 風格
-      messages: [
-        { role: "system", content: [{ text: overrideSystemPrompt || systemPrompt || "" }] },
-        { role: "user", content: [{ text: userText || "" }] },
-      ],
-    },
-    {
-      // 超簡易 input 形式
-      input: fullPrompt,
-    },
-  ];
-
-  const maxRetry = 2;
-
-  for (let bodyIdx = 0; bodyIdx < altBodies.length; bodyIdx++) {
-    let body = altBodies[bodyIdx];
-    let attempt = 0;
-    let currentUserText = userText || "";
-
-    while (attempt <= maxRetry) {
-      try {
-        const res = await axios.post(urlWithKey, body, {
-          headers,
-          timeout: 20000,
-        });
-
-        const data = res.data || {};
-
-        const candidateText =
-          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-          data?.candidates?.[0]?.content?.text ||
-          data?.output?.[0]?.content?.text ||
-          data?.outputs?.[0]?.candidates?.[0]?.content?.parts?.[0]?.text ||
-          data?.responses?.[0]?.items?.map?.((i) => i.text).join("\n") ||
-          data?.text ||
-          null;
-
-        if (candidateText) return String(candidateText);
-
-        console.warn(
-          "Google AI success but no candidate text. keys:",
-          Object.keys(data)
-        );
-        return JSON.stringify(data).slice(0, 1500);
-      } catch (err) {
-        attempt++;
-        const status = err?.response?.status;
-        const respData = err?.response?.data;
-
-        // 400 可能是內容太長，試著縮短再丟一次
-        if (status === 400 && currentUserText.length > 500) {
-          currentUserText = currentUserText.slice(0, 400);
-          if (body.contents) {
-            body.contents[0].parts[0].text =
-              (overrideSystemPrompt || systemPrompt || "") +
-              "\n\n" +
-              currentUserText;
-          }
-          continue;
-        }
-
-        if (status === 404) {
-          console.error(
-            `Google API 404 Not Found for model=${model}. Response:`,
-            respData || err.message
-          );
-        }
-
-        if (attempt > maxRetry) {
-          console.error(
-            `askGoogleAI: failed (bodyIdx=${bodyIdx}) after ${attempt} attempts. status=${status}, err=${err.message}`
-          );
-          if (respData) {
-            console.error(
-              "Response data snippet:",
-              JSON.stringify(respData).slice(0, 1000)
-            );
-          }
-          break;
-        }
-
-        await new Promise((r) => setTimeout(r, 400 * attempt));
-      }
-    }
-  }
-
-  return "⚠️ AI 目前無回應（多次嘗試失敗）。請稍後再試或檢查 GOOGLE_AI_API_KEY / GOOGLE_AI_MODEL 設定。";
-}
-
-// ================== Vision API（圖片 OCR + 標籤） ==================
-async function analyzeImageWithVision(base64Image) {
-  if (!GOOGLE_AI_API_KEY) return { error: "GOOGLE_AI_API_KEY 未設定" };
-
-  const url = `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(
-    GOOGLE_AI_API_KEY
-  )}`;
-
-  const body = {
-    requests: [
-      {
-        image: { content: base64Image },
-        features: [
-          { type: "TEXT_DETECTION", maxResults: 1 },
-          { type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 },
-          { type: "LABEL_DETECTION", maxResults: 5 },
-        ],
+        parts,
       },
     ],
   };
@@ -341,52 +234,42 @@ async function analyzeImageWithVision(base64Image) {
       headers: { "Content-Type": "application/json" },
       timeout: 20000,
     });
-    return res.data;
-  } catch (err) {
-    console.error(
-      "Vision API error:",
-      err.response?.status,
-      err.response?.data || err.message
-    );
-    return { error: err.response?.data || err.message };
-  }
-}
 
-// ================== 交易日誌 trades.json ==================
-const tradesFilePath = path.join(process.cwd(), "trades.json");
-
-async function ensureTradesFile() {
-  try {
-    await fs.promises.access(tradesFilePath);
-  } catch {
-    // 檔案不存在就建一個空陣列
-    await fs.promises.writeFile(tradesFilePath, "[]", "utf-8");
-  }
-}
-
-async function appendTradeLog(entry) {
-  try {
-    await ensureTradesFile();
-    const raw = await fs.promises.readFile(tradesFilePath, "utf-8");
-    let arr = [];
-    try {
-      arr = JSON.parse(raw);
-      if (!Array.isArray(arr)) arr = [];
-    } catch {
-      arr = [];
+    const data = res.data || {};
+    const candidates = data.candidates || [];
+    if (!candidates.length) {
+      console.warn("Gemini 回傳沒有 candidates，data keys:", Object.keys(data));
+      return "⚠️ AI 沒有給出任何回應，請稍後再試。";
     }
-    arr.push(entry);
-    await fs.promises.writeFile(
-      tradesFilePath,
-      JSON.stringify(arr, null, 2),
-      "utf-8"
-    );
+
+    const partsOut = candidates[0].content?.parts || [];
+    const text =
+      partsOut
+        .map((p) => p.text)
+        .filter(Boolean)
+        .join("\n")
+        .trim() || "⚠️ AI 回傳內容為空白。";
+
+    return text;
   } catch (err) {
-    console.error("appendTradeLog error:", err.message);
+    const status = err.response?.status;
+    const respData = err.response?.data;
+    console.error(
+      "askGoogleAI error:",
+      status,
+      err.message,
+      respData ? JSON.stringify(respData).slice(0, 500) : ""
+    );
+
+    if (status === 401 || status === 403) {
+      return "⚠️ AI 權限錯誤（401/403），請檢查 GOOGLE_AI_API_KEY 是否正確或有使用權限。";
+    }
+
+    return "⚠️ AI 目前無法回應，可能伺服器忙碌或設定有誤，請稍後再試。";
   }
 }
 
-// ================== LINE 回覆 Helper ==================
+// ---------------------- LINE 回覆工具 ----------------------
 async function replyToLine(replyToken, text) {
   const url = "https://api.line.me/v2/bot/message/reply";
   try {
@@ -394,12 +277,7 @@ async function replyToLine(replyToken, text) {
       url,
       {
         replyToken,
-        messages: [
-          {
-            type: "text",
-            text: text || "（空回覆）",
-          },
-        ],
+        messages: [{ type: "text", text }],
       },
       {
         headers: {
@@ -418,45 +296,78 @@ async function replyToLine(replyToken, text) {
   }
 }
 
-// ================== 主 Webhook ==================
-app.post("/webhook", async (req, res) => {
+// ---------------------- LINE 簽名驗證 Middleware ----------------------
+function verifyLineSignature(req, res, next) {
+  if (!LINE_CHANNEL_SECRET) {
+    // 沒設定就直接略過驗證（不安全，但避免開發時卡住）
+    return next();
+  }
+
+  try {
+    const signature = req.get("x-line-signature") || "";
+    const body = JSON.stringify(req.body);
+
+    const hash = crypto
+      .createHmac("sha256", LINE_CHANNEL_SECRET)
+      .update(body)
+      .digest("base64");
+
+    if (hash !== signature) {
+      console.warn("Invalid LINE signature");
+      return res.status(401).send("Invalid signature");
+    }
+
+    next();
+  } catch (e) {
+    console.error("verifyLineSignature error:", e.message);
+    next();
+  }
+}
+
+// ---------------------- Webhook 主邏輯 ----------------------
+app.post("/webhook", verifyLineSignature, async (req, res) => {
   const events = req.body.events || [];
 
   for (const event of events) {
     try {
-      const replyToken = event.replyToken;
-      if (!replyToken) continue;
       if (event.type !== "message") continue;
-
+      const replyToken = event.replyToken;
       const message = event.message;
 
-      // -------- 文字訊息 --------
+      // 1) 文字訊息
       if (message.type === "text") {
-        const userText = message.text || "";
-        const startTime = Date.now();
+        const userText = (message.text || "").trim();
 
+        // --- 交易日誌：紀錄 ---
+        if (/^(紀錄|記錄)/.test(userText)) {
+          appendTrade(userText);
+          await replyToLine(
+            replyToken,
+            "✅ 已幫你把這一筆交易紀錄寫進 trades.json。\n之後可以輸入「查紀錄」看最近幾筆。"
+          );
+          continue;
+        }
+
+        // --- 交易日誌：查詢 ---
+        if (/^(查紀錄|查記錄)/.test(userText)) {
+          const out = formatRecentTrades(5);
+          await replyToLine(replyToken, out.substring(0, 2000));
+          continue;
+        }
+
+        // --- 一般獵影策略教練問答 ---
         const answer = await askGoogleAI(userText);
-
-        const usedMs = Date.now() - startTime;
-
-        // 寫入交易日誌
-        await appendTradeLog({
-          type: "text",
-          ts: new Date().toISOString(),
-          userText,
-          aiReply: answer,
-          model: GOOGLE_AI_MODEL,
-          latencyMs: usedMs,
-        });
-
         await replyToLine(replyToken, answer.substring(0, 2000));
       }
-      // -------- 圖片訊息（PoC） --------
+
+      // 2) 圖片訊息：改用 Gemini Vision（不用 Cloud Vision API）
       else if (message.type === "image") {
         const messageId = message.id;
         const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
 
         let imgBase64 = null;
+        let mimeType = "image/jpeg";
+
         try {
           const imgRes = await axios.get(contentUrl, {
             responseType: "arraybuffer",
@@ -465,74 +376,47 @@ app.post("/webhook", async (req, res) => {
             },
             timeout: 15000,
           });
+
+          mimeType =
+            imgRes.headers["content-type"] ||
+            imgRes.headers["Content-Type"] ||
+            "image/jpeg";
+
           imgBase64 = Buffer.from(imgRes.data, "binary").toString("base64");
         } catch (err) {
           console.error(
-            "Failed to download image from LINE:",
+            "下載 LINE 圖片失敗:",
             err.response?.status,
             err.response?.data || err.message
           );
-          await replyToLine(replyToken, "圖片下載失敗，請稍後再試。");
-          continue;
-        }
-
-        const visionRes = await analyzeImageWithVision(imgBase64);
-        if (visionRes.error) {
           await replyToLine(
             replyToken,
-            "圖片辨識失敗（Vision API）。請稍後再試。"
+            "⚠️ 圖片下載失敗，請稍後再傳一次看看。"
           );
           continue;
         }
 
-        const firstResp = visionRes.responses?.[0] || {};
-        const textAnnotations =
-          firstResp.textAnnotations?.[0]?.description ||
-          firstResp.fullTextAnnotation?.text ||
-          "";
-        const labels = (firstResp.labelAnnotations || [])
-          .map((l) => `${l.description}(${Math.round(l.score * 100)}%)`)
-          .join(", ");
+        const visionPrompt =
+          "這是一張 K 線 / 指標 / OBV + 布林帶 的截圖，請完全依照上面的《獵影策略》規則，幫我做：\n" +
+          "1. 判斷目前是否為盤整行情？\n" +
+          "2. 有沒有符合三種進場型態之一（十字星 / 實體吞沒 / 影線吞沒）？\n" +
+          "3. 如果可進場，建議方向（多 / 空）、大概停損位置與 1R~1.5R 停利區間。\n" +
+          "4. 如果條件不符合，請直接說「建議觀望」並說明原因。\n" +
+          "如果圖片資訊不足，你要明確說出還缺哪些關鍵資訊。";
 
-        const prompt = `我收到一張 K 線 / 指標截圖（PoC）。
-
-OCR_text:
-${textAnnotations || "(無)"}
-
-Labels:
-${labels || "(無)"}
-
-請你扮演獵影策略教練：
-1. 嘗試從文字 / 標籤推測這可能是什麼情境（如果資訊不足就明講）。
-2. 用獵影策略邏輯，大致說明「這種盤型適不適合操作？要注意什麼風險？」。
-3. 不要亂保證獲利，強調風險控管與觀望的情境。`;
-
-        const startTime = Date.now();
-        const answer = await askGoogleAI(prompt);
-        const usedMs = Date.now() - startTime;
-
-        const replyText =
-          `PoC 圖片分析結果（OCR + Vision labels）：\n\n` +
-          `OCR 摘要：\n${textAnnotations ? textAnnotations.substring(0, 800) : "(無)"}\n\n` +
-          `Labels：${labels || "(無)"}\n\n` +
-          `AI 判斷（PoC）：\n${answer.substring(0, 1500)}`;
-
-        // 日誌
-        await appendTradeLog({
-          type: "image",
-          ts: new Date().toISOString(),
-          ocrText: textAnnotations,
-          labels,
-          aiReply: answer,
-          model: GOOGLE_AI_MODEL,
-          latencyMs: usedMs,
+        const answer = await askGoogleAI(visionPrompt, {
+          imageBase64: imgBase64,
+          imageMimeType: mimeType,
         });
 
-        await replyToLine(replyToken, replyText);
-      } else {
+        await replyToLine(replyToken, answer.substring(0, 2000));
+      }
+
+      // 3) 其他訊息類型
+      else {
         await replyToLine(
           replyToken,
-          "目前只支援文字與圖片訊息，其他類型暫不支援。"
+          "目前只支援「文字」與「圖片」訊息，其它類型暫時不處理。"
         );
       }
     } catch (err) {
@@ -546,7 +430,7 @@ ${labels || "(無)"}
   res.status(200).send("OK");
 });
 
-// ================== 啟動 Server ==================
+// ---------------------- 啟動伺服器 ----------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("LINE Bot webhook listening on port " + PORT);
