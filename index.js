@@ -34,6 +34,462 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
+// 簡易 Dashboard：用 /debug/trades 的資料畫圖
+app.get("/dashboard", (req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>獵影策略 Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top left, #0f172a, #020617);
+      color: #e5e7eb;
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 24px;
+      font-weight: 700;
+    }
+    .sub {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-bottom: 20px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: rgba(15, 23, 42, 0.9);
+      border-radius: 16px;
+      padding: 16px 18px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.8);
+      backdrop-filter: blur(18px);
+    }
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .card h2 span.icon {
+      font-size: 18px;
+    }
+    .metric-main {
+      font-size: 28px;
+      font-weight: 700;
+    }
+    .metric-sub {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 2px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      background: radial-gradient(circle at top left, rgba(52, 211, 153, 0.12), transparent);
+      color: #a5f3fc;
+      margin-top: 8px;
+    }
+    .pill span.dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #22c55e;
+      box-shadow: 0 0 12px rgba(34, 197, 94, 0.7);
+    }
+    .pill.danger {
+      background: radial-gradient(circle at top left, rgba(248, 113, 113, 0.15), transparent);
+      color: #fecaca;
+    }
+    .pill.danger span.dot {
+      background: #ef4444;
+      box-shadow: 0 0 12px rgba(239, 68, 68, 0.8);
+    }
+    canvas {
+      width: 100% !important;
+      height: 260px !important;
+    }
+    .trades-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .trades-table th,
+    .trades-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid rgba(30, 64, 175, 0.5);
+      white-space: nowrap;
+    }
+    .trades-table th {
+      text-align: left;
+      color: #9ca3af;
+      font-weight: 500;
+    }
+    .tag {
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+    }
+    .tag-long {
+      background: rgba(34, 197, 94, 0.2);
+      color: #bbf7d0;
+    }
+    .tag-short {
+      background: rgba(248, 113, 113, 0.18);
+      color: #fecaca;
+    }
+    .tag-win {
+      background: rgba(34, 197, 94, 0.18);
+      color: #bbf7d0;
+    }
+    .tag-loss {
+      background: rgba(248, 113, 113, 0.18);
+      color: #fecaca;
+    }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 6px;
+    }
+    .status-bar span.highlight {
+      color: #e5e7eb;
+      font-weight: 500;
+    }
+    .badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid rgba(148, 163, 184, 0.5);
+    }
+    .badge.good {
+      border-color: rgba(52, 211, 153, 0.8);
+      color: #bbf7d0;
+    }
+    .badge.bad {
+      border-color: rgba(248, 113, 113, 0.85);
+      color: #fecaca;
+    }
+    .footer {
+      margin-top: 12px;
+      font-size: 11px;
+      color: #6b7280;
+      text-align: right;
+    }
+    .footer span {
+      color: #a5b4fc;
+    }
+    @media (max-width: 640px) {
+      canvas { height: 230px !important; }
+      h1 { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>獵影策略 Performance Board</h1>
+  <div class="sub">你的 LINE 教練正在幫你記帳・這裡是實盤／模擬的績效儀表板。</div>
+
+  <div class="grid">
+    <div class="card">
+      <h2><span class="icon">📊</span> 總體戰績</h2>
+      <div class="metric-main" id="total-trades">--</div>
+      <div class="metric-sub" id="win-loss-text">載入中...</div>
+      <div class="status-bar">
+        <div>勝率：<span class="highlight" id="win-rate">-- %</span></div>
+        <div>平均 R：<span class="highlight" id="avg-r">-- R</span></div>
+      </div>
+      <div class="pill" id="status-pill">
+        <span class="dot"></span>
+        <span id="status-text">等待資料...</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">📈</span> Equity Curve（累積 R）</h2>
+      <canvas id="equityChart"></canvas>
+      <div class="metric-sub">以每筆 R 倍數累加，視覺化你的交易曲線。</div>
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">🧪</span> 最近 20 筆表現</h2>
+      <canvas id="recentChart"></canvas>
+      <div class="metric-sub">綠色代表獲利、紅色代表虧損，單位為 R。</div>
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">📜</span> 最新 10 筆紀錄</h2>
+      <table class="trades-table" id="trades-table">
+        <thead>
+          <tr>
+            <th>時間</th>
+            <th>品種</th>
+            <th>向</th>
+            <th>結果</th>
+            <th>R</th>
+          </tr>
+        </thead>
+        <tbody id="trades-tbody">
+          <tr><td colspan="5">載入中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">
+    Data from <span>/debug/trades</span> ・ Render + LINE Bot 後端
+  </div>
+
+  <script>
+    async function loadDashboard() {
+      try {
+        const res = await fetch("/debug/trades");
+        const data = await res.json();
+
+        if (!data.ok) {
+          document.getElementById("status-text").textContent = "讀取失敗：" + (data.error || "unknown");
+          document.getElementById("status-pill").classList.add("danger");
+          return;
+        }
+
+        const summary = data.summary || {};
+        const trades = Array.isArray(data.trades) ? data.trades : [];
+
+        // ---- 顯示 Summary ----
+        const total = summary.totalTrades ?? trades.length ?? 0;
+        const wins = summary.wins ?? trades.filter(t => t.result === "win").length;
+        const losses = summary.losses ?? trades.filter(t => t.result === "loss").length;
+        const winRate = summary.winRatePercent ?? (total ? (wins / total * 100) : 0);
+        const avgR = summary.avgR ?? (function() {
+          if (!total) return 0;
+          const sumR = trades.reduce((sum, t) => {
+            const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
+            return sum + r;
+          }, 0);
+          return sumR / total;
+        })();
+
+        document.getElementById("total-trades").textContent = total;
+        document.getElementById("win-loss-text").textContent = wins + " 勝 / " + losses + " 敗";
+        document.getElementById("win-rate").textContent = winRate.toFixed(2) + " %";
+        document.getElementById("avg-r").textContent = avgR.toFixed(2) + " R";
+
+        const statusText = document.getElementById("status-text");
+        const statusPill = document.getElementById("status-pill");
+
+        if (!total) {
+          statusText.textContent = "目前還沒有任何紀錄，從下一筆開始幫你追蹤。";
+        } else if (winRate >= 55 && avgR >= 0.7) {
+          statusText.textContent = "策略表現不錯，可以持續依照紀律執行。";
+        } else if (winRate < 40 || avgR < 0) {
+          statusText.textContent = "近期績效較弱，建議減碼或暫停，調整策略／心態。";
+          statusPill.classList.add("danger");
+        } else {
+          statusText.textContent = "表現普通，重點是穩定執行紀律與風控。";
+        }
+
+        // ---- Equity Curve（累積 R）----
+        const sorted = trades
+          .slice()
+          .sort((a, b) => {
+            const ta = new Date(a.timestamp || 0).getTime();
+            const tb = new Date(b.timestamp || 0).getTime();
+            return ta - tb;
+          });
+
+        const equityLabels = [];
+        const equityValues = [];
+        let cumR = 0;
+
+        sorted.forEach((t, idx) => {
+          const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
+          cumR += r;
+          const ts = t.timestamp ? new Date(t.timestamp) : null;
+          const label = ts
+            ? (ts.getMonth() + 1) + "/" + ts.getDate() + " " + String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
+            : "Trade " + (idx + 1);
+          equityLabels.push(label);
+          equityValues.push(cumR);
+        });
+
+        const ctxEquity = document.getElementById("equityChart").getContext("2d");
+        new Chart(ctxEquity, {
+          type: "line",
+          data: {
+            labels: equityLabels,
+            datasets: [{
+              label: "累積 R 倍數",
+              data: equityValues,
+              tension: 0.25,
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: true
+            }]
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: false }
+            },
+            scales: {
+              x: {
+                ticks: { maxTicksLimit: 6, color: "#9ca3af" },
+                grid: { display: false }
+              },
+              y: {
+                ticks: { color: "#9ca3af" },
+                grid: { color: "rgba(30,64,175,0.4)" }
+              }
+            }
+          }
+        });
+
+        // ---- 最近 20 筆表現 ----
+        const recent = sorted.slice(-20);
+        const recentLabels = recent.map((t, i) => "T" + (sorted.length - recent.length + i + 1));
+        const recentValues = recent.map((t) => {
+          return typeof t.rMultiple === "number" ? t.rMultiple : 0;
+        });
+        const recentColors = recent.map((t) => {
+          const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
+          return r >= 0 ? "rgba(52,211,153,0.75)" : "rgba(248,113,113,0.75)";
+        });
+
+        const ctxRecent = document.getElementById("recentChart").getContext("2d");
+        new Chart(ctxRecent, {
+          type: "bar",
+          data: {
+            labels: recentLabels,
+            datasets: [{
+              label: "單筆 R 倍數",
+              data: recentValues,
+              borderWidth: 1,
+              backgroundColor: recentColors
+            }]
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: false }
+            },
+            scales: {
+              x: {
+                ticks: { color: "#9ca3af" },
+                grid: { display: false }
+              },
+              y: {
+                ticks: { color: "#9ca3af" },
+                grid: { color: "rgba(30,64,175,0.4)" }
+              }
+            }
+          }
+        });
+
+        // ---- 最新 10 筆表格 ----
+        const last10 = sorted.slice(-10).reverse();
+        const tbody = document.getElementById("trades-tbody");
+        tbody.innerHTML = "";
+
+        if (!last10.length) {
+          const tr = document.createElement("tr");
+          const td = document.createElement("td");
+          td.colSpan = 5;
+          td.textContent = "尚無資料。";
+          tr.appendChild(td);
+          tbody.appendChild(tr);
+        } else {
+          last10.forEach((t) => {
+            const tr = document.createElement("tr");
+            const ts = t.timestamp ? new Date(t.timestamp) : null;
+            const tsText = ts
+              ? ts.getFullYear().toString().slice(2) + "/" + (ts.getMonth() + 1) + "/" + ts.getDate() +
+                " " + String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
+              : "-";
+
+            const symbol = t.symbol || "-";
+            const dir = t.direction || "-";
+            const result = t.result || "-";
+            const r = typeof t.rMultiple === "number" ? t.rMultiple.toFixed(2) : "-";
+
+            const tdTime = document.createElement("td");
+            tdTime.textContent = tsText;
+
+            const tdSymbol = document.createElement("td");
+            tdSymbol.textContent = symbol;
+
+            const tdDir = document.createElement("td");
+            const dirSpan = document.createElement("span");
+            dirSpan.classList.add("tag");
+            if (dir.toLowerCase() === "long") {
+              dirSpan.classList.add("tag-long");
+              dirSpan.textContent = "做多";
+            } else if (dir.toLowerCase() === "short") {
+              dirSpan.classList.add("tag-short");
+              dirSpan.textContent = "做空";
+            } else {
+              dirSpan.textContent = dir;
+            }
+            tdDir.appendChild(dirSpan);
+
+            const tdResult = document.createElement("td");
+            const resultSpan = document.createElement("span");
+            resultSpan.classList.add("tag");
+            if (result === "win") {
+              resultSpan.classList.add("tag-win");
+              resultSpan.textContent = "獲利";
+            } else if (result === "loss") {
+              resultSpan.classList.add("tag-loss");
+              resultSpan.textContent = "虧損";
+            } else {
+              resultSpan.textContent = result;
+            }
+            tdResult.appendChild(resultSpan);
+
+            const tdR = document.createElement("td");
+            tdR.textContent = r;
+
+            tr.appendChild(tdTime);
+            tr.appendChild(tdSymbol);
+            tr.appendChild(tdDir);
+            tr.appendChild(tdResult);
+            tr.appendChild(tdR);
+            tbody.appendChild(tr);
+          });
+        }
+      } catch (err) {
+        console.error("Dashboard load error:", err);
+        document.getElementById("status-text").textContent = "讀取資料失敗：" + err.message;
+        document.getElementById("status-pill").classList.add("danger");
+      }
+    }
+
+    loadDashboard();
+  </script>
+</body>
+</html>`);
+});
+
+
 // Debug API：查看 trades.json 內容 & 簡單統計
 app.get("/debug/trades", async (req, res) => {
   try {
