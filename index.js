@@ -1,844 +1,385 @@
 // index.js
-// LINE + Gemini 升級版獵影教練 Bot
-// - 文字 + 圖片 都丟給 Gemini（不用 Cloud Vision API）
-// - 自動盤勢判斷（盤整 / 趨勢 / 無法判斷）
-// - 寫入 trades.json 做之後 Dashboard / 回測用
-// - 提供 /api/trades & /dashboard 簡易儀表板
+// 最牛逼版本：LINE Bot + Gemini 文字＆圖片 + 自動紀錄 trades + Dashboard + 盤勢偵測 + 每日推播入口
 
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import fs from "fs/promises";
-import { systemPrompt } from "./prompt.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// ---------------- Env & 小工具 ----------------
+// ====== 檔案路徑設定 ======
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TRADES_FILE = path.join(__dirname, "trades.json");
+const USERS_FILE = path.join(__dirname, "users.json");
 
+// ====== ENV 設定 ======
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY || "";
 const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-2.5-flash";
 
-if (!LINE_CHANNEL_ACCESS_TOKEN) console.warn("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定");
-if (!LINE_CHANNEL_SECRET) console.warn("⚠️ LINE_CHANNEL_SECRET 未設定（將略過簽名驗證）");
-if (!GOOGLE_AI_API_KEY) console.warn("⚠️ GOOGLE_AI_API_KEY 未設定");
-console.log("✅ Using model:", GOOGLE_AI_MODEL);
-
-// 讓 Render / 監控用
-app.get("/health", (req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
-
-// 簡易 Dashboard：用 /debug/trades 的資料畫圖
-app.get("/dashboard", (req, res) => {
-  res.type("html").send(`<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="UTF-8" />
-  <title>獵影策略 Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 20px;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top left, #0f172a, #020617);
-      color: #e5e7eb;
-    }
-    h1 {
-      margin: 0 0 4px;
-      font-size: 24px;
-      font-weight: 700;
-    }
-    .sub {
-      font-size: 12px;
-      color: #9ca3af;
-      margin-bottom: 20px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 16px;
-      margin-bottom: 20px;
-    }
-    .card {
-      background: rgba(15, 23, 42, 0.9);
-      border-radius: 16px;
-      padding: 16px 18px;
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.8);
-      backdrop-filter: blur(18px);
-    }
-    .card h2 {
-      margin: 0 0 8px;
-      font-size: 16px;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .card h2 span.icon {
-      font-size: 18px;
-    }
-    .metric-main {
-      font-size: 28px;
-      font-weight: 700;
-    }
-    .metric-sub {
-      font-size: 12px;
-      color: #9ca3af;
-      margin-top: 2px;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      border: 1px solid rgba(148, 163, 184, 0.4);
-      background: radial-gradient(circle at top left, rgba(52, 211, 153, 0.12), transparent);
-      color: #a5f3fc;
-      margin-top: 8px;
-    }
-    .pill span.dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: #22c55e;
-      box-shadow: 0 0 12px rgba(34, 197, 94, 0.7);
-    }
-    .pill.danger {
-      background: radial-gradient(circle at top left, rgba(248, 113, 113, 0.15), transparent);
-      color: #fecaca;
-    }
-    .pill.danger span.dot {
-      background: #ef4444;
-      box-shadow: 0 0 12px rgba(239, 68, 68, 0.8);
-    }
-    canvas {
-      width: 100% !important;
-      height: 260px !important;
-    }
-    .trades-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-      margin-top: 8px;
-    }
-    .trades-table th,
-    .trades-table td {
-      padding: 6px 8px;
-      border-bottom: 1px solid rgba(30, 64, 175, 0.5);
-      white-space: nowrap;
-    }
-    .trades-table th {
-      text-align: left;
-      color: #9ca3af;
-      font-weight: 500;
-    }
-    .tag {
-      padding: 2px 6px;
-      border-radius: 999px;
-      font-size: 10px;
-    }
-    .tag-long {
-      background: rgba(34, 197, 94, 0.2);
-      color: #bbf7d0;
-    }
-    .tag-short {
-      background: rgba(248, 113, 113, 0.18);
-      color: #fecaca;
-    }
-    .tag-win {
-      background: rgba(34, 197, 94, 0.18);
-      color: #bbf7d0;
-    }
-    .tag-loss {
-      background: rgba(248, 113, 113, 0.18);
-      color: #fecaca;
-    }
-    .status-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 12px;
-      color: #9ca3af;
-      margin-top: 6px;
-    }
-    .status-bar span.highlight {
-      color: #e5e7eb;
-      font-weight: 500;
-    }
-    .badge {
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      border: 1px solid rgba(148, 163, 184, 0.5);
-    }
-    .badge.good {
-      border-color: rgba(52, 211, 153, 0.8);
-      color: #bbf7d0;
-    }
-    .badge.bad {
-      border-color: rgba(248, 113, 113, 0.85);
-      color: #fecaca;
-    }
-    .footer {
-      margin-top: 12px;
-      font-size: 11px;
-      color: #6b7280;
-      text-align: right;
-    }
-    .footer span {
-      color: #a5b4fc;
-    }
-    @media (max-width: 640px) {
-      canvas { height: 230px !important; }
-      h1 { font-size: 20px; }
-    }
-  </style>
-</head>
-<body>
-  <h1>獵影策略 Performance Board</h1>
-  <div class="sub">你的 LINE 教練正在幫你記帳・這裡是實盤／模擬的績效儀表板。</div>
-
-  <div class="grid">
-    <div class="card">
-      <h2><span class="icon">📊</span> 總體戰績</h2>
-      <div class="metric-main" id="total-trades">--</div>
-      <div class="metric-sub" id="win-loss-text">載入中...</div>
-      <div class="status-bar">
-        <div>勝率：<span class="highlight" id="win-rate">-- %</span></div>
-        <div>平均 R：<span class="highlight" id="avg-r">-- R</span></div>
-      </div>
-      <div class="pill" id="status-pill">
-        <span class="dot"></span>
-        <span id="status-text">等待資料...</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2><span class="icon">📈</span> Equity Curve（累積 R）</h2>
-      <canvas id="equityChart"></canvas>
-      <div class="metric-sub">以每筆 R 倍數累加，視覺化你的交易曲線。</div>
-    </div>
-
-    <div class="card">
-      <h2><span class="icon">🧪</span> 最近 20 筆表現</h2>
-      <canvas id="recentChart"></canvas>
-      <div class="metric-sub">綠色代表獲利、紅色代表虧損，單位為 R。</div>
-    </div>
-
-    <div class="card">
-      <h2><span class="icon">📜</span> 最新 10 筆紀錄</h2>
-      <table class="trades-table" id="trades-table">
-        <thead>
-          <tr>
-            <th>時間</th>
-            <th>品種</th>
-            <th>向</th>
-            <th>結果</th>
-            <th>R</th>
-          </tr>
-        </thead>
-        <tbody id="trades-tbody">
-          <tr><td colspan="5">載入中...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="footer">
-    Data from <span>/debug/trades</span> ・ Render + LINE Bot 後端
-  </div>
-
-  <script>
-    async function loadDashboard() {
-      try {
-        const res = await fetch("/debug/trades");
-        const data = await res.json();
-
-        if (!data.ok) {
-          document.getElementById("status-text").textContent = "讀取失敗：" + (data.error || "unknown");
-          document.getElementById("status-pill").classList.add("danger");
-          return;
-        }
-
-        const summary = data.summary || {};
-        const trades = Array.isArray(data.trades) ? data.trades : [];
-
-        // ---- 顯示 Summary ----
-        const total = summary.totalTrades ?? trades.length ?? 0;
-        const wins = summary.wins ?? trades.filter(t => t.result === "win").length;
-        const losses = summary.losses ?? trades.filter(t => t.result === "loss").length;
-        const winRate = summary.winRatePercent ?? (total ? (wins / total * 100) : 0);
-        const avgR = summary.avgR ?? (function() {
-          if (!total) return 0;
-          const sumR = trades.reduce((sum, t) => {
-            const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
-            return sum + r;
-          }, 0);
-          return sumR / total;
-        })();
-
-        document.getElementById("total-trades").textContent = total;
-        document.getElementById("win-loss-text").textContent = wins + " 勝 / " + losses + " 敗";
-        document.getElementById("win-rate").textContent = winRate.toFixed(2) + " %";
-        document.getElementById("avg-r").textContent = avgR.toFixed(2) + " R";
-
-        const statusText = document.getElementById("status-text");
-        const statusPill = document.getElementById("status-pill");
-
-        if (!total) {
-          statusText.textContent = "目前還沒有任何紀錄，從下一筆開始幫你追蹤。";
-        } else if (winRate >= 55 && avgR >= 0.7) {
-          statusText.textContent = "策略表現不錯，可以持續依照紀律執行。";
-        } else if (winRate < 40 || avgR < 0) {
-          statusText.textContent = "近期績效較弱，建議減碼或暫停，調整策略／心態。";
-          statusPill.classList.add("danger");
-        } else {
-          statusText.textContent = "表現普通，重點是穩定執行紀律與風控。";
-        }
-
-        // ---- Equity Curve（累積 R）----
-        const sorted = trades
-          .slice()
-          .sort((a, b) => {
-            const ta = new Date(a.timestamp || 0).getTime();
-            const tb = new Date(b.timestamp || 0).getTime();
-            return ta - tb;
-          });
-
-        const equityLabels = [];
-        const equityValues = [];
-        let cumR = 0;
-
-        sorted.forEach((t, idx) => {
-          const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
-          cumR += r;
-          const ts = t.timestamp ? new Date(t.timestamp) : null;
-          const label = ts
-            ? (ts.getMonth() + 1) + "/" + ts.getDate() + " " + String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
-            : "Trade " + (idx + 1);
-          equityLabels.push(label);
-          equityValues.push(cumR);
-        });
-
-        const ctxEquity = document.getElementById("equityChart").getContext("2d");
-        new Chart(ctxEquity, {
-          type: "line",
-          data: {
-            labels: equityLabels,
-            datasets: [{
-              label: "累積 R 倍數",
-              data: equityValues,
-              tension: 0.25,
-              borderWidth: 2,
-              pointRadius: 0,
-              fill: true
-            }]
-          },
-          options: {
-            responsive: true,
-            plugins: {
-              legend: { display: false }
-            },
-            scales: {
-              x: {
-                ticks: { maxTicksLimit: 6, color: "#9ca3af" },
-                grid: { display: false }
-              },
-              y: {
-                ticks: { color: "#9ca3af" },
-                grid: { color: "rgba(30,64,175,0.4)" }
-              }
-            }
-          }
-        });
-
-        // ---- 最近 20 筆表現 ----
-        const recent = sorted.slice(-20);
-        const recentLabels = recent.map((t, i) => "T" + (sorted.length - recent.length + i + 1));
-        const recentValues = recent.map((t) => {
-          return typeof t.rMultiple === "number" ? t.rMultiple : 0;
-        });
-        const recentColors = recent.map((t) => {
-          const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
-          return r >= 0 ? "rgba(52,211,153,0.75)" : "rgba(248,113,113,0.75)";
-        });
-
-        const ctxRecent = document.getElementById("recentChart").getContext("2d");
-        new Chart(ctxRecent, {
-          type: "bar",
-          data: {
-            labels: recentLabels,
-            datasets: [{
-              label: "單筆 R 倍數",
-              data: recentValues,
-              borderWidth: 1,
-              backgroundColor: recentColors
-            }]
-          },
-          options: {
-            responsive: true,
-            plugins: {
-              legend: { display: false }
-            },
-            scales: {
-              x: {
-                ticks: { color: "#9ca3af" },
-                grid: { display: false }
-              },
-              y: {
-                ticks: { color: "#9ca3af" },
-                grid: { color: "rgba(30,64,175,0.4)" }
-              }
-            }
-          }
-        });
-
-        // ---- 最新 10 筆表格 ----
-        const last10 = sorted.slice(-10).reverse();
-        const tbody = document.getElementById("trades-tbody");
-        tbody.innerHTML = "";
-
-        if (!last10.length) {
-          const tr = document.createElement("tr");
-          const td = document.createElement("td");
-          td.colSpan = 5;
-          td.textContent = "尚無資料。";
-          tr.appendChild(td);
-          tbody.appendChild(tr);
-        } else {
-          last10.forEach((t) => {
-            const tr = document.createElement("tr");
-            const ts = t.timestamp ? new Date(t.timestamp) : null;
-            const tsText = ts
-              ? ts.getFullYear().toString().slice(2) + "/" + (ts.getMonth() + 1) + "/" + ts.getDate() +
-                " " + String(ts.getHours()).padStart(2, "0") + ":" + String(ts.getMinutes()).padStart(2, "0")
-              : "-";
-
-            const symbol = t.symbol || "-";
-            const dir = t.direction || "-";
-            const result = t.result || "-";
-            const r = typeof t.rMultiple === "number" ? t.rMultiple.toFixed(2) : "-";
-
-            const tdTime = document.createElement("td");
-            tdTime.textContent = tsText;
-
-            const tdSymbol = document.createElement("td");
-            tdSymbol.textContent = symbol;
-
-            const tdDir = document.createElement("td");
-            const dirSpan = document.createElement("span");
-            dirSpan.classList.add("tag");
-            if (dir.toLowerCase() === "long") {
-              dirSpan.classList.add("tag-long");
-              dirSpan.textContent = "做多";
-            } else if (dir.toLowerCase() === "short") {
-              dirSpan.classList.add("tag-short");
-              dirSpan.textContent = "做空";
-            } else {
-              dirSpan.textContent = dir;
-            }
-            tdDir.appendChild(dirSpan);
-
-            const tdResult = document.createElement("td");
-            const resultSpan = document.createElement("span");
-            resultSpan.classList.add("tag");
-            if (result === "win") {
-              resultSpan.classList.add("tag-win");
-              resultSpan.textContent = "獲利";
-            } else if (result === "loss") {
-              resultSpan.classList.add("tag-loss");
-              resultSpan.textContent = "虧損";
-            } else {
-              resultSpan.textContent = result;
-            }
-            tdResult.appendChild(resultSpan);
-
-            const tdR = document.createElement("td");
-            tdR.textContent = r;
-
-            tr.appendChild(tdTime);
-            tr.appendChild(tdSymbol);
-            tr.appendChild(tdDir);
-            tr.appendChild(tdResult);
-            tr.appendChild(tdR);
-            tbody.appendChild(tr);
-          });
-        }
-      } catch (err) {
-        console.error("Dashboard load error:", err);
-        document.getElementById("status-text").textContent = "讀取資料失敗：" + err.message;
-        document.getElementById("status-pill").classList.add("danger");
-      }
-    }
-
-    loadDashboard();
-  </script>
-</body>
-</html>`);
-});
-
-
-// Debug API：查看 trades.json 內容 & 簡單統計
-app.get("/debug/trades", async (req, res) => {
-  try {
-    const trades = await loadTrades(); // 用你前面已經定義好的 loadTrades()
-
-    const total = trades.length;
-    const wins = trades.filter((t) => t.result === "win").length;
-    const losses = trades.filter((t) => t.result === "loss").length;
-
-    const winRate = total ? Number(((wins / total) * 100).toFixed(2)) : 0;
-
-    // 平均 R 倍數（如果你有存 rMultiple 的話）
-    let avgR = 0;
-    if (total) {
-      const sumR = trades.reduce((sum, t) => {
-        const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
-        return sum + r;
-      }, 0);
-      avgR = Number((sumR / total).toFixed(2));
-    }
-
-    res.json({
-      ok: true,
-      summary: {
-        totalTrades: total,
-        wins,
-        losses,
-        winRatePercent: winRate,
-        avgR,
-      },
-      trades, // 全部原始紀錄一起丟出去
-    });
-  } catch (err) {
-    console.error("GET /debug/trades error:", err);
-    res.status(500).json({
-      ok: false,
-      error: err.message || String(err),
-    });
-  }
-});
-
-
 function redactedKey(k) {
   if (!k) return "(empty)";
   return k.slice(0, 4) + "..." + k.slice(-4);
 }
-console.log("Gemini key =", redactedKey(GOOGLE_AI_API_KEY));
 
-// ---------------- LINE 簽名驗證 ----------------
+console.log("=== Bot 啟動設定 ===");
+console.log("LINE_CHANNEL_ACCESS_TOKEN:", LINE_CHANNEL_ACCESS_TOKEN ? "set" : "missing");
+console.log("LINE_CHANNEL_SECRET:", LINE_CHANNEL_SECRET ? "set" : "missing");
+console.log("GOOGLE_AI_MODEL:", GOOGLE_AI_MODEL);
+console.log("GOOGLE_AI_API_KEY:", redactedKey(GOOGLE_AI_API_KEY));
+console.log("===================");
 
-function verifyLineSignature(req, res, next) {
-  if (!LINE_CHANNEL_SECRET) return next(); // 沒設定就先略過，不擋住 webhook
+if (!LINE_CHANNEL_ACCESS_TOKEN) {
+  console.warn("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定");
+}
+if (!GOOGLE_AI_API_KEY) {
+  console.warn("⚠️ GOOGLE_AI_API_KEY 未設定");
+}
 
+// ====== 健康檢查 ======
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// ====== trades.json 自動修復 & 讀寫工具 ======
+function ensureJsonFile(pathStr, defaultValue) {
   try {
-    const signature = req.get("x-line-signature") || "";
-    const body = JSON.stringify(req.body);
-    const hash = crypto
-      .createHmac("sha256", LINE_CHANNEL_SECRET)
-      .update(body)
-      .digest("base64");
-
-    if (hash !== signature) {
-      console.warn("❌ Invalid LINE signature");
-      return res.status(401).send("Invalid signature");
+    if (!fs.existsSync(pathStr)) {
+      fs.writeFileSync(pathStr, JSON.stringify(defaultValue, null, 2), "utf8");
+      return;
     }
-    next();
+    const raw = fs.readFileSync(pathStr, "utf8").trim();
+    if (!raw) {
+      fs.writeFileSync(pathStr, JSON.stringify(defaultValue, null, 2), "utf8");
+      return;
+    }
+    JSON.parse(raw); // 只為了確認可 parse
   } catch (e) {
-    console.error("verifyLineSignature error:", e);
-    next();
+    console.error(`${pathStr} 損毀，自動重建：`, e.message);
+    fs.writeFileSync(pathStr, JSON.stringify(defaultValue, null, 2), "utf8");
   }
 }
 
-// ---------------- trades.json 儲存層 ----------------
+ensureJsonFile(TRADES_FILE, []);
+ensureJsonFile(USERS_FILE, []);
 
-const TRADES_FILE = "./trades.json";
-
-// 讀取交易紀錄（自動修復壞掉的 trades.json）
-async function loadTrades() {
+function loadTrades() {
   try {
-    const text = await fs.promises.readFile(TRADES_FILE, "utf8");
-
-    try {
-      const data = JSON.parse(text);
-
-      // 正常情況：是 array 就直接用
-      if (Array.isArray(data)) return data;
-
-      console.warn("trades.json 內容不是陣列，將自動重設為 [].");
-    } catch (parseErr) {
-      // JSON 壞掉（有 // 註解、少括號等等）
-      console.warn(
-        "trades.json JSON 解析失敗，將自動重設為 []. 錯誤：",
-        parseErr.message
-      );
-    }
-
-    // 只要走到這裡，就是內容不對 → 自動重設
-    await fs.promises.writeFile(TRADES_FILE, "[]", "utf8");
+    const raw = fs.readFileSync(TRADES_FILE, "utf8").trim() || "[]";
+    const data = JSON.parse(raw);
+    if (Array.isArray(data)) return data;
+    console.error("trades.json 不是 array，自動重設");
+    fs.writeFileSync(TRADES_FILE, "[]", "utf8");
     return [];
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      // 檔案不存在 → 自動建立空陣列
-      console.warn("trades.json 不存在，將自動建立空檔案。");
-      await fs.promises.writeFile(TRADES_FILE, "[]", "utf8");
-      return [];
-    }
-
-    console.error("loadTrades error（無法讀寫檔案）：", err);
+  } catch (e) {
+    console.error("loadTrades error:", e.message);
+    fs.writeFileSync(TRADES_FILE, "[]", "utf8");
     return [];
   }
 }
 
-
-async function saveTrades(trades) {
+function saveTrades(trades) {
   try {
-    await fs.writeFile(TRADES_FILE, JSON.stringify(trades, null, 2), "utf-8");
+    fs.writeFileSync(TRADES_FILE, JSON.stringify(trades, null, 2), "utf8");
   } catch (e) {
-    console.error("saveTrades error:", e);
+    console.error("saveTrades error:", e.message);
   }
 }
 
-// ---------------- 通用 Gemini caller (文字) ----------------
+function loadUsers() {
+  try {
+    const raw = fs.readFileSync(USERS_FILE, "utf8").trim() || "[]";
+    const data = JSON.parse(raw);
+    if (Array.isArray(data)) return data;
+    fs.writeFileSync(USERS_FILE, "[]", "utf8");
+    return [];
+  } catch (e) {
+    console.error("loadUsers error:", e.message);
+    fs.writeFileSync(USERS_FILE, "[]", "utf8");
+    return [];
+  }
+}
 
-// 最牛逼錯誤防護版 askGoogleAI：多種 body shape + retry + 404/400 判斷
-async function askGoogleAI(userText, sysPrompt = systemPrompt) {
-  if (!GOOGLE_AI_API_KEY) {
-    console.error("Missing GOOGLE_AI_API_KEY");
-    return "⚠️ 系統設定錯誤：AI 金鑰未設定，請聯絡管理員。";
+function saveUsers(users) {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf8");
+  } catch (e) {
+    console.error("saveUsers error:", e.message);
+  }
+}
+
+function rememberUserId(source) {
+  if (!source || !source.userId) return;
+  const users = loadUsers();
+  if (!users.includes(source.userId)) {
+    users.push(source.userId);
+    saveUsers(users);
+  }
+}
+
+// ====== 統計計算（給 Dashboard 用） ======
+function computeStats(trades) {
+  if (!Array.isArray(trades) || trades.length === 0) {
+    return {
+      total: 0,
+      winCount: 0,
+      loseCount: 0,
+      winRate: 0,
+      avgR: 0,
+      totalR: 0,
+      maxDrawdown: 0,
+      maxConsecutiveLosses: 0,
+      last30WinRate: 0,
+      equityCurve: [],
+      marketStateCounts: { range: 0, trend: 0, unknown: 0 },
+    };
   }
 
-  const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
-  const baseUrl =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    encodeURIComponent(model) +
-    ":generateContent";
-  const urlWithKey = baseUrl + "?key=" + encodeURIComponent(GOOGLE_AI_API_KEY);
+  let total = trades.length;
+  let winCount = 0;
+  let loseCount = 0;
+  let totalR = 0;
+  let rList = [];
+  let equity = 0;
+  let peak = 0;
+  let maxDrawdown = 0;
+  let maxConsecLoss = 0;
+  let curConsecLoss = 0;
+  const equityCurve = [];
+  const marketStateCounts = { range: 0, trend: 0, unknown: 0 };
 
-  const headers = { "Content-Type": "application/json" };
+  trades.forEach((t, idx) => {
+    const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
+    const result = t.result || "";
+    const market = t.marketState || "unknown";
 
-  const mainPrompt = (sysPrompt || "") + "\n\n" + (userText || "");
+    if (result === "win") winCount++;
+    if (result === "lose") {
+      loseCount++;
+      curConsecLoss++;
+      if (curConsecLoss > maxConsecLoss) maxConsecLoss = curConsecLoss;
+    } else if (result === "win") {
+      curConsecLoss = 0;
+    }
 
-  const bodyContents = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: mainPrompt }],
-      },
-    ],
+    if (market === "range") marketStateCounts.range++;
+    else if (market === "trend") marketStateCounts.trend++;
+    else marketStateCounts.unknown++;
+
+    totalR += r;
+    rList.push(r);
+    equity += r;
+    if (equity > peak) peak = equity;
+    const dd = peak - equity;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+
+    equityCurve.push({
+      index: idx + 1,
+      equity,
+    });
+  });
+
+  const winRate = total ? (winCount / total) * 100 : 0;
+  const avgR = rList.length ? rList.reduce((a, b) => a + b, 0) / rList.length : 0;
+
+  // 最近 30 筆勝率
+  const recent = trades.slice(-30);
+  let rWin = 0;
+  recent.forEach((t) => {
+    if (t.result === "win") rWin++;
+  });
+  const last30WinRate = recent.length ? (rWin / recent.length) * 100 : 0;
+
+  return {
+    total,
+    winCount,
+    loseCount,
+    winRate,
+    avgR,
+    totalR,
+    maxDrawdown,
+    maxConsecutiveLosses: maxConsecLoss,
+    last30WinRate,
+    equityCurve,
+    marketStateCounts,
   };
+}
 
-  const altBodies = [
-    bodyContents,
+// ====== system prompt（獵影策略教練） ======
+const systemPrompt = `你是一位專門教學「獵影策略」的交易教練 AGENT。
+
+【你的唯一參考聖經】
+- 以使用者提供的《獵影策略》PDF 為最高優先依據。
+- 如果外部資訊與 PDF 內容衝突，一律以 PDF 為主。
+- 你的任務不是發明新策略，而是「忠實解釋、拆解與提醒」這套策略。
+
+【策略核心觀念（由你隨時幫使用者複習）】
+1. 此策略只適用於「盤整行情」：
+- 利用 OBV 在 MA 上下來回碰觸布林帶的型態，判斷是否為盤整。
+- 當 OBV 持續在 MA 之下時，屬於策略禁用時期，要提醒使用者不要硬做。
+
+2. 進場必要條件：
+- OBV 必須先「突破布林帶」，下一根 K 棒收盤「收回布林帶內」。
+- 然後 K 棒要符合三種形態之一：
+  (1) 十字星
+  (2) 實體吞沒
+  (3) 影線吞沒
+- 一律要等 K 棒「收盤後」再判斷。
+
+3. 三種型態具體定義：
+- 十字星：
+  - 上下影線明顯，實體部分小於等於 0.05%。
+  - 進場方式：市價進場，停損依照 ATR。
+- 實體吞沒：
+  - 當前 K 棒的「實體」完全吞沒前一根 K 棒。
+  - 進場方式：用斐波那契找出實體 0.5 的位置掛單，停損依 ATR。
+- 影線吞沒：
+  - 當前 K 棒的「影線」超出前一根 K 棒的影線。
+  - 進場方式：在 SNR 水平掛單進場，停損依 ATR。
+
+4. 止盈止損與風險控管：
+- 建議盈虧比 1R ~ 1.5R。
+- 單筆虧損金額要固定，避免小贏大賠。
+- 如果連續三單止損，視為盤整結束或行情轉變，應提醒使用者「先退出觀望」。
+
+【回答風格】
+- 使用繁體中文，像冷靜、實戰派的交易教練，口語但不廢話。
+- 如果使用者太貪或想 All in，要主動提醒風險與「連虧三單就停止」規則。
+- 不保證獲利，只能說「根據這個策略，理論上該怎麼做」。`;
+
+// ====== Gemini 共用 call 函式 ======
+async function callGemini(contents) {
+  if (!GOOGLE_AI_API_KEY) {
+    console.error("GOOGLE_AI_API_KEY 未設定");
+    return "⚠️ 系統設定錯誤：GOOGLE_AI_API_KEY 未設定。";
+  }
+
+  const model = GOOGLE_AI_MODEL || "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+
+  try {
+    const res = await axios.post(
+      url,
+      { contents },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 30000,
+      }
+    );
+    const data = res.data || {};
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const text = parts.map((p) => p.text || "").join("\n").trim();
+    return text || "（模型沒有回應內容）";
+  } catch (err) {
+    console.error("Gemini 呼叫失敗：", err.response?.status, err.response?.data || err.message);
+    return "⚠️ AI 目前沒有回應，請稍後再試。";
+  }
+}
+
+// 文字模式：純問答教練
+async function askGeminiText(userText) {
+  const input = `${systemPrompt}
+
+下面是使用者的問題，請依獵影策略的規則來回答，並清楚提醒「盤整 / 趨勢」、「是否適用獵影策略」、「建議進出場與停損停利」：
+
+使用者：${userText}
+`;
+  const contents = [
     {
-      contents: [
-        { role: "system", parts: [{ text: sysPrompt || "" }] },
-        { role: "user", parts: [{ text: userText || "" }] },
+      role: "user",
+      parts: [{ text: input }],
+    },
+  ];
+  return await callGemini(contents);
+}
+
+// 圖片模式：請 Gemini 直接讀圖，並輸出 JSON + 說明
+async function analyzeImageWithGemini(base64Image, mimeType = "image/jpeg") {
+  const instruction = `
+你是一位獵影策略教練，請讀取這張截圖（含 K 線、OBV、布林帶）。
+
+請你：
+1. 判斷現在是「盤整」還是「趨勢」。
+2. 判斷是否適用獵影策略。
+3. 如果可進場，請依獵影策略規則給出方向、進場價、停損、1R 與 1.5R 停利目標。
+4. 估計這筆交易的理論 R 倍數（如果有合理的預期）。
+5. 用最多 3 句話說明你如何判斷。
+
+⚠️ 請一定輸出以下 JSON 格式，且「只在一個 \`\`\`json 區塊內給出 JSON」：
+
+\`\`\`json
+{
+  "market_state": "range 或 trend 或 unknown",
+  "strategy_allowed": true 或 false,
+  "reason": "簡短中文說明",
+  "obv_state": "above_ma / below_ma / around_ma / unknown",
+  "bb_state": "touching_band / breaking_band / inside_band / squeeze / expand / unknown",
+  "pattern_type": "doji / body_engulf / shadow_engulf / none / unknown",
+  "direction": "long / short / none",
+  "entry_price": null 或 數字,
+  "stop_loss": null 或 數字,
+  "take_profit_1R": null 或 數字,
+  "take_profit_1_5R": null 或 數字,
+  "r_multiple": null 或 數字,
+  "trade_result": "win / lose / breakeven / none"
+}
+\`\`\`
+
+JSON 之外，你可以再用中文補充說明。`;
+
+  const contents = [
+    {
+      role: "user",
+      parts: [
+        { text: instruction },
+        {
+          inline_data: {
+            mime_type: mimeType,
+            data: base64Image,
+          },
+        },
       ],
     },
-    { input: mainPrompt },
   ];
 
-  const maxRetry = 2;
-
-  for (let bodyIdx = 0; bodyIdx < altBodies.length; bodyIdx++) {
-    let body = altBodies[bodyIdx];
-    let attempt = 0;
-    let shrinkingText = userText || "";
-
-    while (attempt <= maxRetry) {
-      try {
-        const res = await axios.post(urlWithKey, body, {
-          headers,
-          timeout: 20000,
-        });
-
-        const data = res.data || {};
-
-        const text =
-          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-          data?.candidates?.[0]?.content?.text ||
-          data?.text ||
-          null;
-
-        if (text) return String(text);
-
-        console.warn(
-          "Google AI success but no text. keys=",
-          Object.keys(data || {})
-        );
-        return JSON.stringify(data).slice(0, 1500);
-      } catch (err) {
-        attempt++;
-        const status = err?.response?.status;
-        const respData = err?.response?.data;
-
-        if (status === 400 && shrinkingText.length > 500) {
-          // body 太大，剪短 userText 後重試
-          shrinkingText = shrinkingText.slice(0, 400);
-          if (body.contents && body.contents[0]?.parts?.[0]) {
-            body.contents[0].parts[0].text =
-              (sysPrompt || "") + "\n\n" + shrinkingText;
-          }
-          continue;
-        }
-
-        if (status === 404) {
-          console.error(
-            `Google API 404 Not Found for model=${model}. data=`,
-            respData || err.message
-          );
-        }
-
-        if (attempt > maxRetry) {
-          console.error(
-            `askGoogleAI failed (bodyIdx=${bodyIdx}) after ${attempt} attempts. status=${status}, err=${err.message}`
-          );
-          if (respData) {
-            console.error(
-              "Response data snippet:",
-              JSON.stringify(respData).slice(0, 1000)
-            );
-          }
-          break;
-        }
-
-        await new Promise((r) => setTimeout(r, 400 * attempt));
-      }
-    }
-  }
-
-  return "⚠️ AI 目前無回應（多次嘗試失敗）。請稍後再試或檢查 GOOGLE_AI_API_KEY / GOOGLE_AI_MODEL 設定。";
+  const raw = await callGemini(contents);
+  return parseJsonFromGeminiText(raw);
 }
 
-// ---------------- Gemini 圖片分析（inline_data） ----------------
+// 從 Gemini 回傳文字中抽出 JSON
+function parseJsonFromGeminiText(text) {
+  if (!text) return { json: null, raw: "" };
+  let jsonStr = "";
 
-async function analyzeImageWithGeminiBase64(base64Image) {
-  if (!GOOGLE_AI_API_KEY) {
-    return { error: "GOOGLE_AI_API_KEY 未設定" };
+  const matchCode = text.match(/```json([\s\S]*?)```/i);
+  if (matchCode) {
+    jsonStr = matchCode[1].trim();
+  } else {
+    // 沒有 fenced code 就嘗試整段
+    jsonStr = text.trim();
   }
-
-  const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    encodeURIComponent(model) +
-    ":generateContent?key=" +
-    encodeURIComponent(GOOGLE_AI_API_KEY);
-
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text:
-              "這是一張 K 線 / 技術指標截圖。\n" +
-              "請用條列方式回答：\n" +
-              "1. 現在盤勢偏盤整還是偏趨勢？\n" +
-              "2. OBV 與 MA、布林帶的大致關係（用描述即可）。\n" +
-              "3. 是否有出現 十字星 / 實體吞沒 / 影線吞沒（有就寫出來）。\n" +
-              "最後用一句話總結『獵影策略是否適用（適用 / 不適用 / 無法判斷）』。",
-          },
-          {
-            inline_data: {
-              mime_type: "image/png",
-              data: base64Image,
-            },
-          },
-        ],
-      },
-    ],
-  };
 
   try {
-    const res = await axios.post(url, body, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 30000,
-    });
-
-    const parts =
-      res.data?.candidates?.[0]?.content?.parts || [];
-    const text = parts
-      .map((p) => p.text || "")
-      .join("\n")
-      .trim();
-
-    return { summary: text || "(模型沒有回應文字)" };
-  } catch (err) {
-    console.error(
-      "Gemini Vision error:",
-      err.response?.status,
-      err.response?.data || err.message
-    );
-    return { error: err.response?.data || err.message };
-  }
-}
-
-// ---------------- 盤勢分類 helper ----------------
-
-async function classifyRegime(contextText) {
-  if (!GOOGLE_AI_API_KEY) {
-    return {
-      regime: "unknown",
-      strategyAllowed: false,
-      reason: "GOOGLE_AI_API_KEY 未設定",
-    };
-  }
-
-  const classifyPrompt =
-    '你是一位專門判斷「獵影策略是否適用」的盤勢分類助手，只回答 JSON。\n\n' +
-    "請依照以下規則判斷：\n" +
-    '- 如果描述中顯示 OBV 在 MA 上下來回、價格在區間裡震盪、沒有明顯單邊方向，判定為 "range"（盤整，可用策略）。\n' +
-    '- 如果描述中有明顯單邊上漲或下跌、突破走趨勢，判定為 "trend"（趨勢，不可用策略）。\n' +
-    '- 其他無法判斷時，判定為 "unknown"。\n\n' +
-    "請輸出純 JSON，不要加任何解釋文字，例如：\n" +
-    '{"regime":"range","strategyAllowed":true,"reason":"OBV 在 MA 兩側來回、價格在區間震盪"}\n\n' +
-    "現在的情境描述如下：\n" +
-    contextText;
-
-  const raw = await askGoogleAI(classifyPrompt, ""); // 不疊加獵影 systemPrompt
-
-  try {
-    const firstBrace = raw.indexOf("{");
-    const lastBrace = raw.lastIndexOf("}");
-    if (firstBrace === -1 || lastBrace === -1) throw new Error("no json");
-    const jsonStr = raw.slice(firstBrace, lastBrace + 1);
-    const parsed = JSON.parse(jsonStr);
-
-    let regime = parsed.regime || "unknown";
-    if (!["range", "trend", "unknown"].includes(regime)) {
-      regime = "unknown";
-    }
-
-    const strategyAllowed =
-      regime === "range" && parsed.strategyAllowed !== false;
-    const reason = parsed.reason || "";
-
-    return { regime, strategyAllowed, reason };
+    const obj = JSON.parse(jsonStr);
+    return { json: obj, raw: text };
   } catch (e) {
-    console.error("classifyRegime parse error:", e, "raw:", raw);
-    return {
-      regime: "unknown",
-      strategyAllowed: false,
-      reason: "parse error",
-    };
+    console.error("解析 Gemini JSON 失敗：", e.message);
+    return { json: null, raw: text };
   }
 }
 
-// ---------------- LINE 回覆 helper ----------------
-
+// ====== LINE Reply / Push ======
 async function replyToLine(replyToken, text) {
   const url = "https://api.line.me/v2/bot/message/reply";
   try {
@@ -854,345 +395,498 @@ async function replyToLine(replyToken, text) {
       }
     );
   } catch (err) {
-    console.error(
-      "replyToLine error:",
-      err.response?.status,
-      err.response?.data || err.message
-    );
+    console.error("replyToLine error:", err.response?.status, err.response?.data || err.message);
   }
 }
 
-// ---------------- Webhook 主體 ----------------
+async function pushToLine(userId, text) {
+  const url = "https://api.line.me/v2/bot/message/push";
+  try {
+    await axios.post(
+      url,
+      { to: userId, messages: [{ type: "text", text }] },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+  } catch (err) {
+    console.error("pushToLine error:", err.response?.status, err.response?.data || err.message);
+  }
+}
 
+// ====== LINE Signature 驗證 ======
+function verifyLineSignature(req, res, next) {
+  try {
+    if (!LINE_CHANNEL_SECRET) {
+      console.warn("LINE_CHANNEL_SECRET 未設定，略過簽名驗證（不安全，但開發可用）");
+      return next();
+    }
+    const signature = req.get("x-line-signature") || "";
+    const body = JSON.stringify(req.body);
+    const hash = crypto.createHmac("sha256", LINE_CHANNEL_SECRET).update(body).digest("base64");
+    if (hash !== signature) {
+      console.error("Invalid LINE signature");
+      return res.status(401).send("Invalid signature");
+    }
+    next();
+  } catch (e) {
+    console.error("verifyLineSignature error:", e.message);
+    next();
+  }
+}
+
+// ====== LINE Webhook ======
 app.post("/webhook", verifyLineSignature, async (req, res) => {
   const events = req.body.events || [];
-
   for (const event of events) {
-    const replyToken = event.replyToken;
-    const userId = event.source?.userId || "unknown";
-
-    if (event.type !== "message") continue;
-
     try {
+      rememberUserId(event.source);
+
+      if (event.type !== "message") continue;
+      const replyToken = event.replyToken;
       const message = event.message;
 
-      // ---------- 文字訊息 ----------
       if (message.type === "text") {
         const userText = message.text || "";
-
-        const answer = await askGoogleAI(userText, systemPrompt);
-
-        const contextForRegime =
-          "使用者訊息：" +
-          userText +
-          "\n\nAI 回應：" +
-          answer.slice(0, 800);
-
-        const regimeInfo = await classifyRegime(contextForRegime);
-
-        let prefix = "";
-        if (regimeInfo.regime === "range") {
-          prefix =
-            "📊 盤勢判定：偏盤整，獵影策略【可以使用】（仍然要嚴守停損）。\n";
-        } else if (regimeInfo.regime === "trend") {
-          prefix =
-            "📊 盤勢判定：偏趨勢，獵影策略【不建議使用】，以觀望為主。\n";
-        } else {
-          prefix =
-            "📊 盤勢判定：無法明確分辨盤整 / 趨勢，請保守使用獵影策略。\n";
-        }
-
-        const replyText = (prefix + "\n" + answer).slice(0, 2000);
-        await replyToLine(replyToken, replyText);
-
-        const trades = await loadTrades();
-        trades.push({
-          id:
-            Date.now().toString() +
-            "_" +
-            Math.random().toString(36).slice(2, 8),
-          time: new Date().toISOString(),
-          source: "line",
-          userId,
-          kind: "text",
-          userText,
-          aiAnswer: answer,
-          regime: regimeInfo.regime,
-          strategyAllowed: regimeInfo.strategyAllowed,
-          regimeReason: regimeInfo.reason,
-        });
-        await saveTrades(trades);
-
-        // ---------- 圖片訊息 ----------
+        const answer = await askGeminiText(userText);
+        await replyToLine(replyToken, answer.substring(0, 2000));
       } else if (message.type === "image") {
+        // 下載 LINE 圖片
         const messageId = message.id;
         const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
+        let imgBase64 = null;
+        let mimeType = "image/jpeg";
 
-        let imgBase64;
         try {
           const imgRes = await axios.get(contentUrl, {
             responseType: "arraybuffer",
-            headers: {
-              Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-            },
+            headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
             timeout: 15000,
           });
-          imgBase64 = Buffer.from(imgRes.data).toString("base64");
+          const contentType = imgRes.headers["content-type"];
+          if (typeof contentType === "string" && contentType.startsWith("image/")) {
+            mimeType = contentType;
+          }
+          imgBase64 = Buffer.from(imgRes.data, "binary").toString("base64");
         } catch (err) {
-          console.error(
-            "download image error:",
-            err.response?.status,
-            err.response?.data || err.message
-          );
-          await replyToLine(replyToken, "圖片下載失敗，請稍後再試。");
+          console.error("下載 LINE 圖片失敗：", err.response?.status, err.response?.data || err.message);
+          await replyToLine(replyToken, "圖片下載失敗，請稍後再試一次。");
           continue;
         }
 
-        const vision = await analyzeImageWithGeminiBase64(imgBase64);
-        if (vision.error) {
-          await replyToLine(
-            replyToken,
-            "AI 無法解析圖片，請稍後再試或改用文字描述。"
-          );
-          continue;
-        }
+        const { json: analysis, raw: rawText } = await analyzeImageWithGemini(imgBase64, mimeType);
 
-        const imgSummary = vision.summary || "(無法取得圖片摘要)";
+        // 建立 trade 紀錄
+        const trades = loadTrades();
+        const trade = {
+          id: Date.now().toString(),
+          ts: new Date().toISOString(),
+          source: "image",
+          marketState: analysis?.market_state || "unknown",
+          strategyAllowed: typeof analysis?.strategy_allowed === "boolean" ? analysis.strategy_allowed : null,
+          direction: analysis?.direction || "none",
+          entryPrice: typeof analysis?.entry_price === "number" ? analysis.entry_price : null,
+          stopLoss: typeof analysis?.stop_loss === "number" ? analysis.stop_loss : null,
+          takeProfit1R: typeof analysis?.take_profit_1R === "number" ? analysis.take_profit_1R : null,
+          takeProfit1_5R: typeof analysis?.take_profit_1_5R === "number" ? analysis.take_profit_1_5R : null,
+          rMultiple: typeof analysis?.r_multiple === "number" ? analysis.r_multiple : null,
+          result: analysis?.trade_result || "none",
+          obvState: analysis?.obv_state || "unknown",
+          bbState: analysis?.bb_state || "unknown",
+          patternType: analysis?.pattern_type || "unknown",
+          reason: analysis?.reason || "",
+        };
+        trades.push(trade);
+        saveTrades(trades);
 
-        const regimeInfo = await classifyRegime(
-          "圖片盤勢摘要：" + imgSummary.slice(0, 800)
-        );
+        // 給使用者的人類可讀回覆
+        const ms =
+          trade.marketState === "range"
+            ? "盤勢：盤整（策略理論上可用）"
+            : trade.marketState === "trend"
+            ? "盤勢：強趨勢（策略多半禁用）"
+            : "盤勢：無法明確判斷（unknown）";
 
-        const qaPrompt =
-          "以下是使用者傳來的一張 K 線 / 指標截圖的 AI 文字摘要：\n" +
-          imgSummary +
-          "\n\n請你完全依照《獵影策略》的規則，幫使用者跑完決策流程（盤整判斷、三種型態、進場點、停損、停利、風險提醒）。";
+        const sa =
+          trade.strategyAllowed === true
+            ? "✅ 根據圖形，獵影策略「可考慮使用」。"
+            : trade.strategyAllowed === false
+            ? "❌ 根據圖形，建議「暫停獵影策略，先觀望」。"
+            : "⚠️ 模型沒有明確標記策略可用 / 禁用。";
 
-        const answer = await askGoogleAI(qaPrompt, systemPrompt);
+        const dir =
+          trade.direction === "long"
+            ? "方向：做多"
+            : trade.direction === "short"
+            ? "方向：做空"
+            : "方向：暫不建議進場";
 
-        let prefix = "";
-        if (regimeInfo.regime === "range") {
-          prefix =
-            "📊 盤勢判定：偏盤整，獵影策略【可以使用】（記得固定 1R 風險）。\n";
-        } else if (regimeInfo.regime === "trend") {
-          prefix =
-            "📊 盤勢判定：偏趨勢，獵影策略【不建議使用】，先觀望。\n";
-        } else {
-          prefix =
-            "📊 盤勢判定：無法明確分辨盤整 / 趨勢，請保守使用獵影策略。\n";
-        }
+        const priceInfo =
+          trade.entryPrice && trade.stopLoss
+            ? `進場價約：${trade.entryPrice}\n停損約：${trade.stopLoss}\n1R 目標：約：${trade.takeProfit1R ?? "（模型未給）"}\n1.5R 目標：約：${
+                trade.takeProfit1_5R ?? "（模型未給）"
+              }`
+            : "此圖模型無法給出明確的進場價與停損，請以風險控管為優先。";
 
-        const replyText =
-          (
-            "📷 圖片分析摘要：\n" +
-            imgSummary.slice(0, 800) +
-            "\n\n" +
-            prefix +
-            "\n" +
-            answer
-          ).slice(0, 2000);
+        const reasonText = trade.reason ? `教練說明：${trade.reason}` : "模型沒有額外說明原因。";
 
-        await replyToLine(replyToken, replyText);
+        const replyText = `🧠 獵影教練圖像分析（已記錄到 Dashboard）
 
-        const trades = await loadTrades();
-        trades.push({
-          id:
-            Date.now().toString() +
-            "_" +
-            Math.random().toString(36).slice(2, 8),
-          time: new Date().toISOString(),
-          source: "line",
-          userId,
-          kind: "image",
-          imageSummary: imgSummary,
-          aiAnswer: answer,
-          regime: regimeInfo.regime,
-          strategyAllowed: regimeInfo.strategyAllowed,
-          regimeReason: regimeInfo.reason,
-        });
-        await saveTrades(trades);
+${ms}
+${sa}
+${dir}
+
+${priceInfo}
+
+OBV 狀態：${trade.obvState}
+布林狀態：${trade.bbState}
+型態判斷：${trade.patternType}
+
+${reasonText}
+
+（註：以上為策略教學用途，非保證獲利）`;
+
+        await replyToLine(replyToken, replyText.substring(0, 2000));
       } else {
-        await replyToLine(
-          replyToken,
-          "目前只支援文字與圖片訊息，其他類型暫不支援喔。"
-        );
+        await replyToLine(replyToken, "目前只支援文字與圖片訊息，其他類型暫不支援。");
       }
-    } catch (e) {
-      console.error(
-        "Error processing event:",
-        e.response?.data || e.message || e
-      );
+    } catch (err) {
+      console.error("Error processing event:", err.response?.data || err.message || err);
     }
   }
 
   res.status(200).send("OK");
 });
 
-// ---------------- API: 讓之後 Dashboard 用 ----------------
-
-app.get("/api/trades", async (req, res) => {
-  const trades = await loadTrades();
+// ====== Dashboard API ======
+app.get("/api/trades", (req, res) => {
+  const trades = loadTrades();
   res.json({ trades });
 });
 
-// ---------------- 超簡單 Dashboard ----------------
-
-const dashboardHtml = `<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="UTF-8" />
-  <title>獵影策略 Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 16px; background:#0b1020; color:#f5f5f5; }
-    h1 { margin-bottom: 8px; }
-    .cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:20px; }
-    .card { background:#151a2c; border-radius:12px; padding:12px 16px; min-width:160px; box-shadow:0 4px 16px rgba(0,0,0,0.4); }
-    .label { font-size:12px; opacity:0.7; }
-    .value { font-size:20px; font-weight:bold; margin-top:4px; }
-    canvas { background:#0b1020; border-radius:12px; padding:8px; }
-    .chart-row { display:flex; flex-wrap:wrap; gap:20px; }
-    .chart-box { flex:1 1 280px; }
-    a { color:#4fc3f7; }
-  </style>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head>
-<body>
-  <h1>獵影策略 Dashboard</h1>
-  <div class="label">資料來源：trades.json（來自 LINE Bot 實際互動）</div>
-
-  <div class="cards">
-    <div class="card">
-      <div class="label">總紀錄數</div>
-      <div class="value" id="totalTrades">-</div>
-    </div>
-    <div class="card">
-      <div class="label">盤整次數 (range)</div>
-      <div class="value" id="rangeCount">-</div>
-    </div>
-    <div class="card">
-      <div class="label">趨勢次數 (trend)</div>
-      <div class="value" id="trendCount">-</div>
-    </div>
-    <div class="card">
-      <div class="label">策略可用比例</div>
-      <div class="value" id="allowedRatio">-</div>
-    </div>
-  </div>
-
-  <div class="chart-row">
-    <div class="chart-box">
-      <canvas id="regimeChart" height="240"></canvas>
-    </div>
-    <div class="chart-box">
-      <canvas id="timelineChart" height="240"></canvas>
-    </div>
-  </div>
-
-  <script>
-    async function loadTrades() {
-      const res = await fetch('/api/trades');
-      const json = await res.json();
-      return json.trades || [];
-    }
-
-    function groupByRegime(trades) {
-      const counts = { range:0, trend:0, unknown:0 };
-      trades.forEach(t => {
-        const r = t.regime || 'unknown';
-        if (counts[r] === undefined) counts[r] = 0;
-        counts[r] += 1;
-      });
-      return counts;
-    }
-
-    function buildTimeline(trades) {
-      const byDay = {};
-      trades.forEach(t => {
-        const d = (t.time || '').slice(0,10);
-        if (!d) return;
-        if (!byDay[d]) byDay[d] = { total:0, range:0 };
-        byDay[d].total += 1;
-        if (t.regime === 'range') byDay[d].range += 1;
-      });
-      const days = Object.keys(byDay).sort();
-      return {
-        labels: days,
-        total: days.map(d => byDay[d].total),
-        range: days.map(d => byDay[d].range)
-      };
-    }
-
-    function makeRegimeChart(ctx, counts) {
-      new Chart(ctx, {
-        type: 'doughnut',
-        data: {
-          labels: ['range(盤整)','trend(趨勢)','unknown'],
-          datasets: [{
-            data: [counts.range, counts.trend, counts.unknown]
-          }]
-        },
-        options: {
-          plugins: {
-            legend: { labels: { color:'#f5f5f5' } }
-          }
-        }
-      });
-    }
-
-    function makeTimelineChart(ctx, timeline) {
-      new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: timeline.labels,
-          datasets: [
-            { label:'總紀錄數', data: timeline.total, borderWidth:2 },
-            { label:'盤整次數(range)', data: timeline.range, borderWidth:2 }
-          ]
-        },
-        options: {
-          scales: {
-            x: { ticks:{ color:'#f5f5f5' } },
-            y: { ticks:{ color:'#f5f5f5' } }
-          },
-          plugins: {
-            legend: { labels: { color:'#f5f5f5' } }
-          }
-        }
-      });
-    }
-
-    (async function init() {
-      const trades = await loadTrades();
-
-      const total = trades.length;
-      const counts = groupByRegime(trades);
-      const allowedCount = trades.filter(t => t.strategyAllowed).length;
-      const allowedRatio = total ? (allowedCount * 100 / total).toFixed(1) + '%' : '-';
-
-      document.getElementById('totalTrades').textContent = total;
-      document.getElementById('rangeCount').textContent = counts.range || 0;
-      document.getElementById('trendCount').textContent = counts.trend || 0;
-      document.getElementById('allowedRatio').textContent = allowedRatio;
-
-      const timeline = buildTimeline(trades);
-
-      const regimeCtx = document.getElementById('regimeChart').getContext('2d');
-      makeRegimeChart(regimeCtx, counts);
-
-      const tlCtx = document.getElementById('timelineChart').getContext('2d');
-      makeTimelineChart(tlCtx, timeline);
-    })();
-  </script>
-</body>
-</html>`;
-
-app.get("/dashboard", (req, res) => {
-  res.type("html").send(dashboardHtml);
+app.get("/api/stats", (req, res) => {
+  const trades = loadTrades();
+  const stats = computeStats(trades);
+  res.json({ stats, tradesCount: trades.length });
 });
 
-// ---------------- 啟動伺服器 ----------------
+// ====== Dashboard 頁面 ======
+app.get("/dashboard", (req, res) => {
+  const html = `<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<title>獵影策略 Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e5e7eb; }
+  header { padding: 16px 24px; background: #020617; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center; }
+  h1 { font-size: 20px; margin: 0; }
+  .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; border: 1px solid #4b5563; }
+  main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card { background: #020617; border-radius: 16px; padding: 16px; border: 1px solid #1f2937; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+  .card h2 { margin: 0 0 8px; font-size: 16px; }
+  .value { font-size: 24px; font-weight: 600; }
+  .label { font-size: 12px; color: #9ca3af; }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; margin-right: 6px; }
+  .pill-green { background: rgba(34,197,94,0.1); color: #bbf7d0; border: 1px solid rgba(34,197,94,0.4); }
+  .pill-red { background: rgba(248,113,113,0.1); color: #fecaca; border: 1px solid rgba(248,113,113,0.4); }
+  .pill-slate { background: rgba(148,163,184,0.15); color: #e5e7eb; border: 1px solid rgba(148,163,184,0.4); }
+  canvas { max-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #1f2937; text-align: left; }
+  th { color: #9ca3af; font-weight: 500; }
+  tr:hover { background: rgba(15,23,42,0.8); }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #4b5563; display: inline-block; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<header>
+  <div>
+    <h1>獵影策略 Performance Dashboard</h1>
+    <div style="font-size: 12px; color:#9ca3af;margin-top:4px;">來源：你在 LINE 傳的每一張 K 線 / OBV / 布林圖，AI 解析後自動記錄。</div>
+  </div>
+  <div class="badge" id="marketBadge">載入中...</div>
+</header>
+<main>
+  <div class="grid">
+    <div class="card">
+      <h2>整體表現</h2>
+      <div class="value" id="totalR">0 R</div>
+      <div class="label">累積 R 倍數（全部交易）</div>
+      <div style="margin-top:8px;">
+        <span class="pill pill-green" id="winRate">勝率：--%</span>
+        <span class="pill pill-slate" id="avgR">平均 R：--</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>風險狀態</h2>
+      <div class="value" id="maxDD">0 R</div>
+      <div class="label">最大回撤</div>
+      <div style="margin-top:8px;">
+        <span class="pill pill-red" id="maxConsecLoss">最大連虧：--</span>
+        <span class="pill pill-slate" id="recentWinRate">近 30 筆勝率：--%</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>盤勢統計</h2>
+      <div class="value" id="tradeCount">0 筆</div>
+      <div class="label">已記錄的圖像分析 / 交易樣本</div>
+      <div style="margin-top:8px;">
+        <span class="pill pill-green" id="rangeCount">盤整：--</span>
+        <span class="pill pill-red" id="trendCount">趨勢：--</span>
+        <span class="pill pill-slate" id="unknownCount">未知：--</span>
+      </div>
+    </div>
+  </div>
 
+  <div class="grid">
+    <div class="card">
+      <h2>Equity Curve（R）</h2>
+      <canvas id="equityChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>最近 30 筆勝率走勢</h2>
+      <canvas id="rollingWinChart"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>近期紀錄（最新 20 筆）</h2>
+    <table id="tradesTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>時間</th>
+          <th>盤勢</th>
+          <th>策略</th>
+          <th>方向</th>
+          <th>R</th>
+          <th>結果</th>
+          <th>備註</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+async function fetchStats() {
+  const res = await fetch("/api/stats");
+  const data = await res.json();
+  return data;
+}
+
+function formatTs(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    return d.toLocaleString("zh-TW", { hour12: false });
+  } catch {
+    return ts;
+  }
+}
+
+function setupNumbers(stats, tradesCount) {
+  document.getElementById("totalR").textContent = (stats.totalR || 0).toFixed(2) + " R";
+  document.getElementById("winRate").textContent = "勝率：" + (stats.winRate || 0).toFixed(1) + "%";
+  document.getElementById("avgR").textContent = "平均 R：" + (stats.avgR || 0).toFixed(2);
+  document.getElementById("maxDD").textContent = (stats.maxDrawdown || 0).toFixed(2) + " R";
+  document.getElementById("maxConsecLoss").textContent = "最大連虧：" + (stats.maxConsecutiveLosses || 0) + " 筆";
+  document.getElementById("recentWinRate").textContent = "近 30 筆勝率：" + (stats.last30WinRate || 0).toFixed(1) + "%";
+
+  document.getElementById("tradeCount").textContent = tradesCount + " 筆";
+  document.getElementById("rangeCount").textContent = "盤整：" + (stats.marketStateCounts?.range || 0);
+  document.getElementById("trendCount").textContent = "趨勢：" + (stats.marketStateCounts?.trend || 0);
+  document.getElementById("unknownCount").textContent = "未知：" + (stats.marketStateCounts?.unknown || 0);
+
+  const badge = document.getElementById("marketBadge");
+  if (tradesCount === 0) {
+    badge.textContent = "尚無資料，請先在 LINE 傳一張圖";
+    return;
+  }
+  const last = window.__trades && window.__trades[window.__trades.length - 1];
+  if (!last) {
+    badge.textContent = "尚無資料";
+    return;
+  }
+  if (last.marketState === "range") {
+    badge.textContent = "今日偏盤整：獵影策略理論上可用 ✅";
+  } else if (last.marketState === "trend") {
+    badge.textContent = "今日偏趨勢：獵影策略建議暫停 ❌";
+  } else {
+    badge.textContent = "盤勢：未知（資料不足）";
+  }
+}
+
+function setupEquityChart(equityCurve) {
+  const ctx = document.getElementById("equityChart").getContext("2d");
+  new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: equityCurve.map(p => p.index),
+      datasets: [{
+        label: "累積 R",
+        data: equityCurve.map(p => p.equity),
+        tension: 0.25
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: "#e5e7eb" } }
+      },
+      scales: {
+        x: { ticks: { color: "#9ca3af" }, grid: { color: "#111827" } },
+        y: { ticks: { color: "#9ca3af" }, grid: { color: "#111827" } }
+      }
+    }
+  });
+}
+
+function setupRollingWinChart(trades) {
+  const points = [];
+  let wins = 0;
+  let total = 0;
+  for (let i = 0; i < trades.length; i++) {
+    total++;
+    if (trades[i].result === "win") wins++;
+    const start = Math.max(0, i - 29);
+    const slice = trades.slice(start, i + 1);
+    const win = slice.filter(t => t.result === "win").length;
+    const wr = slice.length ? (win / slice.length) * 100 : 0;
+    points.push({ idx: i + 1, wr });
+  }
+
+  const ctx = document.getElementById("rollingWinChart").getContext("2d");
+  new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: points.map(p => p.idx),
+      datasets: [{
+        label: "近 30 筆勝率（%）",
+        data: points.map(p => p.wr),
+        tension: 0.25
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: "#e5e7eb" } }
+      },
+      scales: {
+        x: { ticks: { color: "#9ca3af" }, grid: { color: "#111827" } },
+        y: { ticks: { color: "#9ca3af" }, grid: { color: "#111827" } }
+      }
+    }
+  });
+}
+
+function setupTable(trades) {
+  const tbody = document.querySelector("#tradesTable tbody");
+  tbody.innerHTML = "";
+  const recent = trades.slice(-20).reverse();
+  recent.forEach((t, idx) => {
+    const tr = document.createElement("tr");
+    const marketText =
+      t.marketState === "range" ? "盤整" :
+      t.marketState === "trend" ? "趨勢" : "未知";
+    const strategyText =
+      t.strategyAllowed === true ? "可用" :
+      t.strategyAllowed === false ? "禁用" : "未標記";
+
+    const dirText =
+      t.direction === "long" ? "多" :
+      t.direction === "short" ? "空" :
+      "—";
+
+    const r = typeof t.rMultiple === "number" ? t.rMultiple.toFixed(2) : "—";
+
+    const resultText =
+      t.result === "win" ? "勝" :
+      t.result === "lose" ? "敗" :
+      t.result === "breakeven" ? "打平" :
+      "—";
+
+    tr.innerHTML = \`
+      <td>\${recent.length - idx}</td>
+      <td>\${formatTs(t.ts)}</td>
+      <td>\${marketText}</td>
+      <td>\${strategyText}</td>
+      <td>\${dirText}</td>
+      <td>\${r}</td>
+      <td>\${resultText}</td>
+      <td>\${(t.reason || "").slice(0, 40)}</td>
+    \`;
+    tbody.appendChild(tr);
+  });
+}
+
+(async function init() {
+  try {
+    const res = await fetch("/api/trades");
+    const d1 = await res.json();
+    window.__trades = d1.trades || [];
+    const statsRes = await fetch("/api/stats");
+    const d2 = await statsRes.json();
+    const stats = d2.stats || {};
+    const count = d2.tradesCount || window.__trades.length || 0;
+
+    setupNumbers(stats, count);
+    setupEquityChart(stats.equityCurve || []);
+    setupRollingWinChart(window.__trades || []);
+    setupTable(window.__trades || []);
+  } catch (e) {
+    console.error("Dashboard 載入失敗：", e);
+    document.getElementById("marketBadge").textContent = "Dashboard 載入失敗，請稍後重試";
+  }
+})();
+</script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// ====== 每日推播入口（之後可以接 Render cron） ======
+app.get("/cron/daily-check", async (req, res) => {
+  try {
+    const users = loadUsers();
+    if (!users.length) {
+      return res.json({ ok: false, message: "尚未記錄任何 LINE 使用者。" });
+    }
+    const userId = users[0]; // 單人使用情境：用第一個即可
+
+    const trades = loadTrades();
+    if (!trades.length) {
+      await pushToLine(userId, "尚未有任何盤勢紀錄，請先傳一張圖給「獵影教練」。");
+      return res.json({ ok: true, message: "no trades; notified" });
+    }
+    const last = trades[trades.length - 1];
+    let msg = "";
+    if (last.marketState === "range") {
+      msg = "【每日盤勢檢查】\n最近一筆盤勢偏「盤整」，獵影策略理論上可用 ✅\n\n記得依照 OBV + 布林規則與 ATR 做風險控管。";
+    } else if (last.marketState === "trend") {
+      msg = "【每日盤勢檢查】\n最近一筆盤勢偏「強趨勢」，建議暫停使用獵影策略 ❌\n\n這種盤容易被來回洗，先觀望、等盤整再上。";
+    } else {
+      msg = "【每日盤勢檢查】\n盤勢：未知（資料不足）\n建議再截一張 OBV + 布林圖給獵影教練分析。";
+    }
+
+    await pushToLine(userId, msg);
+    res.json({ ok: true, message: "pushed", lastMarketState: last.marketState || "unknown" });
+  } catch (e) {
+    console.error("/cron/daily-check error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ====== 啟動 Server ======
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("LINE Bot webhook listening on port " + PORT);
