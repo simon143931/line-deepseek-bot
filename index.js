@@ -1,50 +1,51 @@
 // index.js
-// LINE Bot + Gemini (文字 + 圖片) + 交易紀錄 + 風控 + 簡易 Dashboard
+// LINE + Gemini 升級版獵影教練 Bot
+// - 文字 + 圖片 都丟給 Gemini（不用 Cloud Vision API）
+// - 自動盤勢判斷（盤整 / 趨勢 / 無法判斷）
+// - 寫入 trades.json 做之後 Dashboard / 回測用
+// - 提供 /api/trades & /dashboard 簡易儀表板
 
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import fs from "fs";
+import fs from "fs/promises";
+import { systemPrompt } from "./prompt.js";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// ------------------------- 環境變數 & 基本設定 -------------------------
+// ---------------- Env & 小工具 ----------------
+
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY || "";
 const GOOGLE_AI_MODEL = process.env.GOOGLE_AI_MODEL || "gemini-1.5-flash";
 
-const TRADES_FILE = "./trades.json";
+if (!LINE_CHANNEL_ACCESS_TOKEN) console.warn("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定");
+if (!LINE_CHANNEL_SECRET) console.warn("⚠️ LINE_CHANNEL_SECRET 未設定（將略過簽名驗證）");
+if (!GOOGLE_AI_API_KEY) console.warn("⚠️ GOOGLE_AI_API_KEY 未設定");
+console.log("✅ Using model:", GOOGLE_AI_MODEL);
 
-// 健康檢查
-app.get("/health", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
+// 讓 Render / 監控用
+app.get("/health", (req, res) =>
+  res.json({ ok: true, time: new Date().toISOString() })
+);
 
 function redactedKey(k) {
   if (!k) return "(empty)";
-  if (k.length <= 8) return "****";
   return k.slice(0, 4) + "..." + k.slice(-4);
 }
+console.log("Gemini key =", redactedKey(GOOGLE_AI_API_KEY));
 
-console.log("=== Bot 啟動設定 ===");
-console.log("LINE_CHANNEL_ACCESS_TOKEN:", LINE_CHANNEL_ACCESS_TOKEN ? "set" : "MISSING");
-console.log("LINE_CHANNEL_SECRET:", LINE_CHANNEL_SECRET ? "set" : "MISSING");
-console.log("GOOGLE_AI_MODEL:", GOOGLE_AI_MODEL);
-console.log("GOOGLE_AI_API_KEY:", redactedKey(GOOGLE_AI_API_KEY));
-console.log("===================");
+// ---------------- LINE 簽名驗證 ----------------
 
-// ------------------------- LINE 簽章驗證 -------------------------
 function verifyLineSignature(req, res, next) {
+  if (!LINE_CHANNEL_SECRET) return next(); // 沒設定就先略過，不擋住 webhook
+
   try {
-    if (!LINE_CHANNEL_SECRET) {
-      console.warn("LINE_CHANNEL_SECRET 未設定，跳過簽章驗證（不建議正式環境這樣做）");
-      return next();
-    }
     const signature = req.get("x-line-signature") || "";
     const body = JSON.stringify(req.body);
     const hash = crypto
@@ -53,335 +54,165 @@ function verifyLineSignature(req, res, next) {
       .digest("base64");
 
     if (hash !== signature) {
-      console.warn("Invalid LINE signature");
+      console.warn("❌ Invalid LINE signature");
       return res.status(401).send("Invalid signature");
     }
     next();
   } catch (e) {
-    console.error("verifyLineSignature error:", e.message);
+    console.error("verifyLineSignature error:", e);
     next();
   }
 }
 
-// ------------------------- 獵影策略 system prompt -------------------------
-const systemPrompt = `
-你是一位專門教學「獵影策略」的交易教練 AGENT。
+// ---------------- trades.json 儲存層 ----------------
 
-【你的唯一參考聖經】
-- 以使用者提供的《獵影策略》PDF 為最高優先依據。
-- 如果外部資訊與 PDF 內容衝突，一律以 PDF 為主。
-- 你的任務不是發明新策略，而是「忠實解釋、拆解與提醒」這套策略。
+const TRADES_FILE = "./trades.json";
 
-【策略核心觀念（由你隨時幫使用者複習）】
-1. 此策略只適用於「盤整行情」：
-  - 利用 OBV 在 MA 上下來回碰觸布林帶的型態，判斷是否為盤整。
-  - 當 OBV 持續在 MA 之下時，屬於策略禁用時期，要提醒使用者不要硬做。
-
-2. 進場必要條件：
-  - OBV 必須先「突破布林帶」，下一根 K 棒收盤「收回布林帶內」。
-  - 然後 K 棒要符合三種形態之一：
-    (1) 十字星
-    (2) 實體吞沒
-    (3) 影線吞沒
-  - 一律要等 K 棒「收盤後」再判斷，請你每次都提醒使用者這一點。
-
-3. 三種型態具體定義：
-  - 十字星：
-    - 上下影線明顯，實體部分小於等於 0.05%。
-    - 進場方式：市價進場，停損依照 ATR。
-  - 實體吞沒：
-    - 當前 K 棒的「實體」完全吞沒前一根 K 棒。
-    - 進場方式：用斐波那契找出實體 0.5 的位置掛單，停損依 ATR。
-  - 影線吞沒：
-    - 當前 K 棒的「影線」超出前一根 K 棒的影線。
-    - 進場方式：在 SNR 水平掛單進場，停損依 ATR。
-
-4. 止盈止損與風險控管：
-  - 建議盈虧比 1R ~ 1.5R。
-  - 單筆虧損金額要固定，避免小贏大賠。
-  - 舉例：如果倉位是 50%，實盤 0.45% 的波動配 100 倍槓桿，只是約 45% 獲利，不能太貪。
-  - 如果連續三單止損，視為盤整結束或行情轉變，應提醒使用者「先退出觀望」。
-
-【你回答問題的風格與格式】
-1. 使用「繁體中文」，語氣像一位冷靜、實戰派的交易教練，口語但不廢話。
-2. 每次回答問題時，盡量依照：
-   A. 先判斷「這個情境是否適用獵影策略」。
-   B. 如果適用，逐步拆解：
-      - 第 1 步：先看 OBV 與布林帶狀況
-      - 第 2 步：檢查三種 K 棒型態是否成立
-      - 第 3 步：說明進場方式（市價 / 掛單在哪裡）
-      - 第 4 步：如何依 ATR 設停損
-      - 第 5 步：如何設 1R ~ 1.5R 停利
-   C. 如果不適用，直接說明為何不適用，並提醒使用者最好空手觀望。
-
-3. 如果使用者只問「能不能進場？」或描述很少，你要主動幫他檢查：
-   - 現在是否為盤整行情？（依 OBV + 布林帶規則）
-   - 有沒有符合三種 K 棒進場型態之一？（十字星、實體吞沒、影線吞沒）
-   - ATR 的距離有沒有足夠風險收益比？（至少 1R 以上）
-   - 有沒有連虧三單、應該暫停交易？
-
-   資訊不足時，要清楚告訴他還缺哪些關鍵資訊，並用簡單的方式引導補充，而不是亂猜。
-
-4. 如果使用者問的是觀念問題（例：什麼是十字星？為什麼要等收盤？）：
-   - 用生活化比喻、條列說明，讓交易小白也看得懂。
-   - 可以參考《獵影策略》的精神，但不要整段照抄，要用你自己的話重述。
-
-5. 風險警示：
-   - 你不能保證獲利，只能說「根據這個策略，理論上該怎麼做」。
-   - 當使用者太貪婪或想 All in，你要主動提醒風險與「連虧三單就停止」的規則。
-   - 你只提供教育性說明，不能給「保證賺錢」或「一定會翻倍」的承諾。
-
-【圖片處理】
-- 收到 K 線 / 指標截圖時，你要盡量從圖中推斷：
-  - OBV 與 MA、布林帶關係
-  - 當前 K 棒是否為：十字星 / 實體吞沒 / 影線吞沒 / 都不是
-  - 盤整 or 趨勢
-
-【機器決策輸出格式（給後端程式用）】
-不管使用者問什麼，每一次回答的最後一行，你都要輸出一段「純 JSON」，不要加任何多餘文字或註解，格式如下：
-
-{"is_trade": false, "symbol": "", "direction": "", "entry": null, "stop": null, "tp1": null, "tp15": null, "risk_r": 1, "note": "簡短說明這次回覆的性質（例如：純教學 / 盤整判斷 / 真正進場建議）"}
-
-說明：
-- 如果這次有給出「明確進場建議」，請：
-  - is_trade 設為 true
-  - symbol：例如 "BTCUSDT"（如果不知道，盡量從用戶文字判斷）
-  - direction："long" 或 "short"
-  - entry / stop / tp1 / tp15：用數字（價格），不知道就用 null
-  - risk_r：這一單預期最大虧損約幾 R，不知道就設為 1
-  - note：20 字內說明進場邏輯（例如："OBV 回到 MA 上方 + 十字星"）
-
-- 如果這次是純理論教學 / 心態 / 沒有下單建議，請：
-  - is_trade 設為 false
-  - 其他欄位可以是空字串或 null
-
-這個 JSON 一定要是整個回覆的最後一行。
-`;
-
-// ------------------------- trades.json 讀寫 & 風控 -------------------------
-
-function loadTrades() {
+async function loadTrades() {
   try {
-    if (!fs.existsSync(TRADES_FILE)) return [];
-    const raw = fs.readFileSync(TRADES_FILE, "utf-8");
-    const data = JSON.parse(raw);
+    const txt = await fs.readFile(TRADES_FILE, "utf-8");
+    const data = JSON.parse(txt);
     return Array.isArray(data) ? data : [];
   } catch (e) {
-    console.error("loadTrades error:", e.message);
+    if (e.code === "ENOENT") return [];
+    console.error("loadTrades error:", e);
     return [];
   }
 }
 
-function saveTrades(trades) {
+async function saveTrades(trades) {
   try {
-    fs.writeFileSync(TRADES_FILE, JSON.stringify(trades, null, 2));
+    await fs.writeFile(TRADES_FILE, JSON.stringify(trades, null, 2), "utf-8");
   } catch (e) {
-    console.error("saveTrades error:", e.message);
+    console.error("saveTrades error:", e);
   }
 }
 
-function addTradeFromSummary(summary) {
-  const trades = loadTrades();
-  const now = new Date().toISOString();
-  const trade = {
-    id: Date.now(),
-    time: now,
-    symbol: summary.symbol || "",
-    direction: summary.direction || "",
-    entry: summary.entry ?? null,
-    stop: summary.stop ?? null,
-    tp1: summary.tp1 ?? null,
-    tp15: summary.tp15 ?? null,
-    risk_r: typeof summary.risk_r === "number" ? summary.risk_r : 1,
-    note: summary.note || "",
-    result: "pending", // 之後用 #結果 勝 / 敗 來更新
-    closedAt: null,
-  };
-  trades.push(trade);
-  saveTrades(trades);
-  return trade;
-}
+// ---------------- 通用 Gemini caller (文字) ----------------
 
-function computeStats(trades) {
-  const finished = trades.filter((t) => t.result === "win" || t.result === "loss");
-  const total = finished.length;
-  const wins = finished.filter((t) => t.result === "win").length;
-  const losses = finished.filter((t) => t.result === "loss").length;
-  const winRate = total ? Math.round((wins / total) * 100) : 0;
-
-  // 累積 R（win +R, loss -R）
-  const totalR = finished.reduce((sum, t) => {
-    const r = typeof t.risk_r === "number" ? Math.abs(t.risk_r) : 1;
-    return sum + (t.result === "win" ? r : -r);
-  }, 0);
-
-  // 連虧次數（從最後一筆往回數）
-  let consecutiveLoss = 0;
-  for (let i = finished.length - 1; i >= 0; i--) {
-    if (finished[i].result === "loss") consecutiveLoss++;
-    else break;
-  }
-
-  return { total, wins, losses, winRate, totalR, consecutiveLoss };
-}
-
-function evaluateRiskBeforeNewTrade() {
-  const trades = loadTrades();
-  const stats = computeStats(trades);
-
-  // 風控規則（可以之後再調整）：
-  const maxConsecutiveLoss = 3; // 連虧 3 單停
-  const maxDailyLossR = -3; // 當日累積 -3R 停
-
-  // 檢查連虧
-  if (stats.consecutiveLoss >= maxConsecutiveLoss) {
-    return {
-      allow: false,
-      message:
-        `⚠️ 風控提醒：你已連續虧損 ${stats.consecutiveLoss} 單。\n` +
-        `依照獵影策略風控，建議暫停交易、只觀察盤勢。\n` +
-        `這次我會照樣給你分析，但不紀錄成新的一筆交易。`,
-    };
-  }
-
-  // 簡易「當日 R」計算：只粗略看 closedAt 在今天的
-  const now = new Date();
-  const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
-  const finishedToday = trades.filter(
-    (t) =>
-      (t.result === "win" || t.result === "loss") &&
-      ((t.closedAt && t.closedAt.startsWith(todayStr)) ||
-        (!t.closedAt && t.time && t.time.startsWith(todayStr))),
-  );
-
-  const todayR = finishedToday.reduce((sum, t) => {
-    const r = typeof t.risk_r === "number" ? Math.abs(t.risk_r) : 1;
-    return sum + (t.result === "win" ? r : -r);
-  }, 0);
-
-  if (todayR <= maxDailyLossR) {
-    return {
-      allow: false,
-      message:
-        `⚠️ 風控提醒：你今天累積約 ${todayR.toFixed(2)} R 虧損，已達每日風控上限（約 ${maxDailyLossR} R）。\n` +
-        `今天不建議再開新倉，先休息、復盤會更安全。這次我一樣幫你分析，但不紀錄成新的一筆交易。`,
-    };
-  }
-
-  return { allow: true, message: "" };
-}
-
-// 處理 #結果 勝 / #結果 敗 指令，更新上一筆 pending 交易
-async function handleResultCommand(replyToken, userText) {
-  const lower = userText.toLowerCase();
-
-  const isWin = lower.includes("勝") || lower.includes("贏") || lower.includes("win");
-  const isLoss = lower.includes("敗") || lower.includes("虧") || lower.includes("輸") || lower.includes("loss");
-
-  if (!isWin && !isLoss) {
-    await replyToLine(
-      replyToken,
-      "要更新交易結果，請這樣輸入：\n\n#結果 勝\n或\n#結果 敗",
-    );
-    return;
-  }
-
-  const trades = loadTrades();
-  if (!trades.length) {
-    await replyToLine(replyToken, "目前沒有任何交易紀錄，先讓我幫你找一個進場點再說吧。");
-    return;
-  }
-
-  // 找最後一筆 result 不是 win / loss 的
-  let idx = -1;
-  for (let i = trades.length - 1; i >= 0; i--) {
-    if (!trades[i].result || trades[i].result === "pending") {
-      idx = i;
-      break;
-    }
-  }
-
-  if (idx === -1) {
-    await replyToLine(replyToken, "目前沒有未結束的交易紀錄，可以先讓我幫你找新的進場機會。");
-    return;
-  }
-
-  trades[idx].result = isWin ? "win" : "loss";
-  trades[idx].closedAt = new Date().toISOString();
-  saveTrades(trades);
-
-  const stats = computeStats(trades);
-  const txt =
-    `已更新上一筆交易結果為：${isWin ? "✅ 勝" : "❌ 敗"}。\n\n` +
-    `目前統計（已結束）：\n` +
-    `- 總筆數：${stats.total}\n` +
-    `- 勝率：約 ${stats.winRate}%\n` +
-    `- 連續虧損：${stats.consecutiveLoss} 單\n` +
-    `- 累積 R 值：約 ${stats.totalR.toFixed(2)} R`;
-
-  await replyToLine(replyToken, txt);
-}
-
-// 解析 Gemini 回覆最後一行 JSON
-function extractDecisionSummary(fullAnswer) {
-  try {
-    const lines = fullAnswer.trim().split("\n");
-    if (!lines.length) return null;
-    const lastLine = lines[lines.length - 1].trim();
-    if (!lastLine.startsWith("{") || !lastLine.endsWith("}")) return null;
-    const summary = JSON.parse(lastLine);
-    return summary;
-  } catch (e) {
-    return null;
-  }
-}
-
-// 把 Gemini 回覆 + 風控 + 記錄交易 串起來
-function applyRiskAndMaybeLog(fullAnswer) {
-  const summary = extractDecisionSummary(fullAnswer);
-
-  if (!summary || !summary.is_trade) {
-    // 純教學 / 沒有進場建議，直接原樣回
-    return fullAnswer;
-  }
-
-  // 先做風控檢查
-  const risk = evaluateRiskBeforeNewTrade();
-  if (!risk.allow) {
-    // 給風控警告，但不紀錄交易
-    return `${risk.message}\n\n${fullAnswer}`;
-  }
-
-  // 通過風控，紀錄這一筆建議
-  addTradeFromSummary(summary);
-
-  const trades = loadTrades();
-  const stats = computeStats(trades);
-
-  const extra =
-    `\n\n——\n` +
-    `📊 目前簡易統計（已結束交易）：\n` +
-    `- 總筆數：${stats.total}\n` +
-    `- 勝率：約 ${stats.winRate}%\n` +
-    `- 連續虧損：${stats.consecutiveLoss} 單\n` +
-    `- 累積 R 值：約 ${stats.totalR.toFixed(2)} R\n` +
-    `※ 出場後記得用「#結果 勝」或「#結果 敗」更新，風控才會幫你擋子彈。`;
-
-  return fullAnswer + extra;
-}
-
-// ------------------------- Gemini 文字 & 圖片 -------------------------
-
-async function askGoogleAI(userText, sysPrompt = "") {
+// 最牛逼錯誤防護版 askGoogleAI：多種 body shape + retry + 404/400 判斷
+async function askGoogleAI(userText, sysPrompt = systemPrompt) {
   if (!GOOGLE_AI_API_KEY) {
     console.error("Missing GOOGLE_AI_API_KEY");
-    return "⚠️ 系統設定錯誤：GOOGLE_AI_API_KEY 未設定，請聯絡管理員。";
+    return "⚠️ 系統設定錯誤：AI 金鑰未設定，請聯絡管理員。";
   }
 
   const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
-  )}:generateContent?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+  const baseUrl =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent";
+  const urlWithKey = baseUrl + "?key=" + encodeURIComponent(GOOGLE_AI_API_KEY);
+
+  const headers = { "Content-Type": "application/json" };
+
+  const mainPrompt = (sysPrompt || "") + "\n\n" + (userText || "");
+
+  const bodyContents = {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: mainPrompt }],
+      },
+    ],
+  };
+
+  const altBodies = [
+    bodyContents,
+    {
+      contents: [
+        { role: "system", parts: [{ text: sysPrompt || "" }] },
+        { role: "user", parts: [{ text: userText || "" }] },
+      ],
+    },
+    { input: mainPrompt },
+  ];
+
+  const maxRetry = 2;
+
+  for (let bodyIdx = 0; bodyIdx < altBodies.length; bodyIdx++) {
+    let body = altBodies[bodyIdx];
+    let attempt = 0;
+    let shrinkingText = userText || "";
+
+    while (attempt <= maxRetry) {
+      try {
+        const res = await axios.post(urlWithKey, body, {
+          headers,
+          timeout: 20000,
+        });
+
+        const data = res.data || {};
+
+        const text =
+          data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+          data?.candidates?.[0]?.content?.text ||
+          data?.text ||
+          null;
+
+        if (text) return String(text);
+
+        console.warn(
+          "Google AI success but no text. keys=",
+          Object.keys(data || {})
+        );
+        return JSON.stringify(data).slice(0, 1500);
+      } catch (err) {
+        attempt++;
+        const status = err?.response?.status;
+        const respData = err?.response?.data;
+
+        if (status === 400 && shrinkingText.length > 500) {
+          // body 太大，剪短 userText 後重試
+          shrinkingText = shrinkingText.slice(0, 400);
+          if (body.contents && body.contents[0]?.parts?.[0]) {
+            body.contents[0].parts[0].text =
+              (sysPrompt || "") + "\n\n" + shrinkingText;
+          }
+          continue;
+        }
+
+        if (status === 404) {
+          console.error(
+            `Google API 404 Not Found for model=${model}. data=`,
+            respData || err.message
+          );
+        }
+
+        if (attempt > maxRetry) {
+          console.error(
+            `askGoogleAI failed (bodyIdx=${bodyIdx}) after ${attempt} attempts. status=${status}, err=${err.message}`
+          );
+          if (respData) {
+            console.error(
+              "Response data snippet:",
+              JSON.stringify(respData).slice(0, 1000)
+            );
+          }
+          break;
+        }
+
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+      }
+    }
+  }
+
+  return "⚠️ AI 目前無回應（多次嘗試失敗）。請稍後再試或檢查 GOOGLE_AI_API_KEY / GOOGLE_AI_MODEL 設定。";
+}
+
+// ---------------- Gemini 圖片分析（inline_data） ----------------
+
+async function analyzeImageWithGeminiBase64(base64Image) {
+  if (!GOOGLE_AI_API_KEY) {
+    return { error: "GOOGLE_AI_API_KEY 未設定" };
+  }
+
+  const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent?key=" +
+    encodeURIComponent(GOOGLE_AI_API_KEY);
 
   const body = {
     contents: [
@@ -390,9 +221,18 @@ async function askGoogleAI(userText, sysPrompt = "") {
         parts: [
           {
             text:
-              (sysPrompt || systemPrompt) +
-              "\n\n下面是使用者的輸入，請依照上面的獵影策略與風控規則回答，最後一行輸出純 JSON 決策摘要。\n\n" +
-              userText,
+              "這是一張 K 線 / 技術指標截圖。\n" +
+              "請用條列方式回答：\n" +
+              "1. 現在盤勢偏盤整還是偏趨勢？\n" +
+              "2. OBV 與 MA、布林帶的大致關係（用描述即可）。\n" +
+              "3. 是否有出現 十字星 / 實體吞沒 / 影線吞沒（有就寫出來）。\n" +
+              "最後用一句話總結『獵影策略是否適用（適用 / 不適用 / 無法判斷）』。",
+          },
+          {
+            inline_data: {
+              mime_type: "image/png",
+              data: base64Image,
+            },
           },
         ],
       },
@@ -405,258 +245,430 @@ async function askGoogleAI(userText, sysPrompt = "") {
       timeout: 30000,
     });
 
-    const data = res.data || {};
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map((p) => p.text || "").join("\n").trim();
-    return text || "（AI 沒有回覆內容）";
+    const parts =
+      res.data?.candidates?.[0]?.content?.parts || [];
+    const text = parts
+      .map((p) => p.text || "")
+      .join("\n")
+      .trim();
+
+    return { summary: text || "(模型沒有回應文字)" };
   } catch (err) {
     console.error(
-      "askGoogleAI error:",
+      "Gemini Vision error:",
       err.response?.status,
-      err.response?.data || err.message,
+      err.response?.data || err.message
     );
-    return "⚠️ AI 回應失敗，請稍後再試。";
+    return { error: err.response?.data || err.message };
   }
 }
 
-async function askGeminiVision(base64Image, extraUserText = "") {
+// ---------------- 盤勢分類 helper ----------------
+
+async function classifyRegime(contextText) {
   if (!GOOGLE_AI_API_KEY) {
-    console.error("Missing GOOGLE_AI_API_KEY");
-    return "⚠️ 系統設定錯誤：GOOGLE_AI_API_KEY 未設定，請聯絡管理員。";
+    return {
+      regime: "unknown",
+      strategyAllowed: false,
+      reason: "GOOGLE_AI_API_KEY 未設定",
+    };
   }
 
-  const model = GOOGLE_AI_MODEL || "gemini-1.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
-  )}:generateContent?key=${encodeURIComponent(GOOGLE_AI_API_KEY)}`;
+  const classifyPrompt =
+    '你是一位專門判斷「獵影策略是否適用」的盤勢分類助手，只回答 JSON。\n\n' +
+    "請依照以下規則判斷：\n" +
+    '- 如果描述中顯示 OBV 在 MA 上下來回、價格在區間裡震盪、沒有明顯單邊方向，判定為 "range"（盤整，可用策略）。\n' +
+    '- 如果描述中有明顯單邊上漲或下跌、突破走趨勢，判定為 "trend"（趨勢，不可用策略）。\n' +
+    '- 其他無法判斷時，判定為 "unknown"。\n\n' +
+    "請輸出純 JSON，不要加任何解釋文字，例如：\n" +
+    '{"regime":"range","strategyAllowed":true,"reason":"OBV 在 MA 兩側來回、價格在區間震盪"}\n\n' +
+    "現在的情境描述如下：\n" +
+    contextText;
 
-  const promptText =
-    systemPrompt +
-    "\n\n這是一張使用者提供的 K 線 / 指標截圖，請依《獵影策略》幫忙判斷盤整 / 趨勢、是否有進場訊號，並在最後一行輸出純 JSON 決策摘要。使用者補充說明（如有）：\n" +
-    (extraUserText || "");
-
-  const body = {
-    contents: [
-      {
-        parts: [
-          { text: promptText },
-          {
-            inline_data: {
-              mime_type: "image/jpeg",
-              data: base64Image,
-            },
-          },
-        ],
-      },
-    ],
-  };
+  const raw = await askGoogleAI(classifyPrompt, ""); // 不疊加獵影 systemPrompt
 
   try {
-    const res = await axios.post(url, body, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 40000,
-    });
+    const firstBrace = raw.indexOf("{");
+    const lastBrace = raw.lastIndexOf("}");
+    if (firstBrace === -1 || lastBrace === -1) throw new Error("no json");
+    const jsonStr = raw.slice(firstBrace, lastBrace + 1);
+    const parsed = JSON.parse(jsonStr);
 
-    const data = res.data || {};
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map((p) => p.text || "").join("\n").trim();
-    return text || "（AI 沒有針對圖片給出內容）";
-  } catch (err) {
-    console.error(
-      "askGeminiVision error:",
-      err.response?.status,
-      err.response?.data || err.message,
-    );
-    return "⚠️ 圖片分析失敗，請稍後再試。";
+    let regime = parsed.regime || "unknown";
+    if (!["range", "trend", "unknown"].includes(regime)) {
+      regime = "unknown";
+    }
+
+    const strategyAllowed =
+      regime === "range" && parsed.strategyAllowed !== false;
+    const reason = parsed.reason || "";
+
+    return { regime, strategyAllowed, reason };
+  } catch (e) {
+    console.error("classifyRegime parse error:", e, "raw:", raw);
+    return {
+      regime: "unknown",
+      strategyAllowed: false,
+      reason: "parse error",
+    };
   }
 }
 
-// ------------------------- LINE 回覆工具 -------------------------
+// ---------------- LINE 回覆 helper ----------------
 
 async function replyToLine(replyToken, text) {
   const url = "https://api.line.me/v2/bot/message/reply";
   try {
     await axios.post(
       url,
-      {
-        replyToken,
-        messages: [
-          {
-            type: "text",
-            text: text.slice(0, 2000),
-          },
-        ],
-      },
+      { replyToken, messages: [{ type: "text", text }] },
       {
         headers: {
           Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
           "Content-Type": "application/json",
         },
         timeout: 10000,
-      },
+      }
     );
   } catch (err) {
     console.error(
       "replyToLine error:",
       err.response?.status,
-      err.response?.data || err.message,
+      err.response?.data || err.message
     );
   }
 }
 
-// ------------------------- Dashboard（簡易網頁） -------------------------
-
-app.get("/dashboard", (req, res) => {
-  const trades = loadTrades();
-  const stats = computeStats(trades);
-
-  const rows = trades
-    .map((t) => {
-      return `
-      <tr>
-        <td>${new Date(t.time).toLocaleString("zh-TW")}</td>
-        <td>${t.symbol || ""}</td>
-        <td>${t.direction || ""}</td>
-        <td>${t.entry ?? ""}</td>
-        <td>${t.stop ?? ""}</td>
-        <td>${t.tp1 ?? ""}</td>
-        <td>${t.tp15 ?? ""}</td>
-        <td>${t.risk_r ?? ""}</td>
-        <td>${t.result || "pending"}</td>
-        <td>${t.note || ""}</td>
-      </tr>
-    `;
-    })
-    .join("\n");
-
-  const html = `
-  <!DOCTYPE html>
-  <html lang="zh-Hant">
-  <head>
-    <meta charset="UTF-8" />
-    <title>獵影策略 Dashboard</title>
-    <style>
-      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 20px; background: #111; color: #eee; }
-      h1 { margin-bottom: 0.2rem; }
-      .stats { margin-bottom: 1rem; }
-      table { border-collapse: collapse; width: 100%; font-size: 13px; }
-      th, td { border: 1px solid #444; padding: 4px 6px; text-align: center; }
-      th { background: #222; }
-      tr:nth-child(even) { background: #181818; }
-      tr:nth-child(odd) { background: #131313; }
-      .tag { display:inline-block; padding:2px 6px; border-radius:4px; background:#333; margin-right:6px; font-size:12px; }
-    </style>
-  </head>
-  <body>
-    <h1>獵影策略 Dashboard</h1>
-    <div class="stats">
-      <div class="tag">已結束總筆數：${stats.total}</div>
-      <div class="tag">勝率：約 ${stats.winRate}%</div>
-      <div class="tag">連續虧損：${stats.consecutiveLoss} 單</div>
-      <div class="tag">累積 R 值：約 ${stats.totalR.toFixed(2)} R</div>
-      <p style="margin-top:8px;color:#aaa;">※ 出場後記得在 LINE 裡輸入「#結果 勝」或「#結果 敗」，這邊的統計才會更新。</p>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>時間</th>
-          <th>標的</th>
-          <th>方向</th>
-          <th>進場</th>
-          <th>停損</th>
-          <th>TP 1R</th>
-          <th>TP 1.5R</th>
-          <th>Risk R</th>
-          <th>結果</th>
-          <th>備註</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows || '<tr><td colspan="10">目前還沒有任何交易紀錄。</td></tr>'}
-      </tbody>
-    </table>
-  </body>
-  </html>
-  `;
-
-  res.send(html);
-});
-
-// ------------------------- LINE Webhook -------------------------
+// ---------------- Webhook 主體 ----------------
 
 app.post("/webhook", verifyLineSignature, async (req, res) => {
   const events = req.body.events || [];
 
   for (const event of events) {
-    try {
-      const replyToken = event.replyToken;
-      if (!replyToken) continue;
-      if (event.type !== "message") continue;
+    const replyToken = event.replyToken;
+    const userId = event.source?.userId || "unknown";
 
+    if (event.type !== "message") continue;
+
+    try {
       const message = event.message;
 
-      // 文字訊息
+      // ---------- 文字訊息 ----------
       if (message.type === "text") {
-        const userText = (message.text || "").trim();
+        const userText = message.text || "";
 
-        // 特殊指令：#結果 勝 / 敗
-        if (userText.startsWith("#結果")) {
-          await handleResultCommand(replyToken, userText);
-          continue;
+        const answer = await askGoogleAI(userText, systemPrompt);
+
+        const contextForRegime =
+          "使用者訊息：" +
+          userText +
+          "\n\nAI 回應：" +
+          answer.slice(0, 800);
+
+        const regimeInfo = await classifyRegime(contextForRegime);
+
+        let prefix = "";
+        if (regimeInfo.regime === "range") {
+          prefix =
+            "📊 盤勢判定：偏盤整，獵影策略【可以使用】（仍然要嚴守停損）。\n";
+        } else if (regimeInfo.regime === "trend") {
+          prefix =
+            "📊 盤勢判定：偏趨勢，獵影策略【不建議使用】，以觀望為主。\n";
+        } else {
+          prefix =
+            "📊 盤勢判定：無法明確分辨盤整 / 趨勢，請保守使用獵影策略。\n";
         }
 
-        const aiAnswer = await askGoogleAI(userText, systemPrompt);
-        const finalReply = applyRiskAndMaybeLog(aiAnswer);
-        await replyToLine(replyToken, finalReply);
-      }
+        const replyText = (prefix + "\n" + answer).slice(0, 2000);
+        await replyToLine(replyToken, replyText);
 
-      // 圖片訊息
-      else if (message.type === "image") {
+        const trades = await loadTrades();
+        trades.push({
+          id:
+            Date.now().toString() +
+            "_" +
+            Math.random().toString(36).slice(2, 8),
+          time: new Date().toISOString(),
+          source: "line",
+          userId,
+          kind: "text",
+          userText,
+          aiAnswer: answer,
+          regime: regimeInfo.regime,
+          strategyAllowed: regimeInfo.strategyAllowed,
+          regimeReason: regimeInfo.reason,
+        });
+        await saveTrades(trades);
+
+        // ---------- 圖片訊息 ----------
+      } else if (message.type === "image") {
         const messageId = message.id;
         const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
 
-        let imgBase64 = null;
+        let imgBase64;
         try {
           const imgRes = await axios.get(contentUrl, {
             responseType: "arraybuffer",
-            headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+            headers: {
+              Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+            },
             timeout: 15000,
           });
-          imgBase64 = Buffer.from(imgRes.data, "binary").toString("base64");
+          imgBase64 = Buffer.from(imgRes.data).toString("base64");
         } catch (err) {
           console.error(
-            "下載 LINE 圖片失敗:",
+            "download image error:",
             err.response?.status,
-            err.response?.data || err.message,
+            err.response?.data || err.message
           );
+          await replyToLine(replyToken, "圖片下載失敗，請稍後再試。");
+          continue;
+        }
+
+        const vision = await analyzeImageWithGeminiBase64(imgBase64);
+        if (vision.error) {
           await replyToLine(
             replyToken,
-            "圖片下載失敗，請稍後再傳一次截圖看看。",
+            "AI 無法解析圖片，請稍後再試或改用文字描述。"
           );
           continue;
         }
 
-        const aiAnswer = await askGeminiVision(imgBase64);
-        const finalReply = applyRiskAndMaybeLog(aiAnswer);
-        await replyToLine(replyToken, finalReply);
-      }
+        const imgSummary = vision.summary || "(無法取得圖片摘要)";
 
-      // 其他類型先簡單回覆
-      else {
+        const regimeInfo = await classifyRegime(
+          "圖片盤勢摘要：" + imgSummary.slice(0, 800)
+        );
+
+        const qaPrompt =
+          "以下是使用者傳來的一張 K 線 / 指標截圖的 AI 文字摘要：\n" +
+          imgSummary +
+          "\n\n請你完全依照《獵影策略》的規則，幫使用者跑完決策流程（盤整判斷、三種型態、進場點、停損、停利、風險提醒）。";
+
+        const answer = await askGoogleAI(qaPrompt, systemPrompt);
+
+        let prefix = "";
+        if (regimeInfo.regime === "range") {
+          prefix =
+            "📊 盤勢判定：偏盤整，獵影策略【可以使用】（記得固定 1R 風險）。\n";
+        } else if (regimeInfo.regime === "trend") {
+          prefix =
+            "📊 盤勢判定：偏趨勢，獵影策略【不建議使用】，先觀望。\n";
+        } else {
+          prefix =
+            "📊 盤勢判定：無法明確分辨盤整 / 趨勢，請保守使用獵影策略。\n";
+        }
+
+        const replyText =
+          (
+            "📷 圖片分析摘要：\n" +
+            imgSummary.slice(0, 800) +
+            "\n\n" +
+            prefix +
+            "\n" +
+            answer
+          ).slice(0, 2000);
+
+        await replyToLine(replyToken, replyText);
+
+        const trades = await loadTrades();
+        trades.push({
+          id:
+            Date.now().toString() +
+            "_" +
+            Math.random().toString(36).slice(2, 8),
+          time: new Date().toISOString(),
+          source: "line",
+          userId,
+          kind: "image",
+          imageSummary: imgSummary,
+          aiAnswer: answer,
+          regime: regimeInfo.regime,
+          strategyAllowed: regimeInfo.strategyAllowed,
+          regimeReason: regimeInfo.reason,
+        });
+        await saveTrades(trades);
+      } else {
         await replyToLine(
           replyToken,
-          "目前只支援文字與圖片訊息，其它類型暫時不處理。",
+          "目前只支援文字與圖片訊息，其他類型暫不支援喔。"
         );
       }
-    } catch (err) {
-      console.error("Error processing event:", err.response?.data || err.message || err);
+    } catch (e) {
+      console.error(
+        "Error processing event:",
+        e.response?.data || e.message || e
+      );
     }
   }
 
   res.status(200).send("OK");
 });
 
-// ------------------------- 啟動伺服器 -------------------------
+// ---------------- API: 讓之後 Dashboard 用 ----------------
+
+app.get("/api/trades", async (req, res) => {
+  const trades = await loadTrades();
+  res.json({ trades });
+});
+
+// ---------------- 超簡單 Dashboard ----------------
+
+const dashboardHtml = `<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>獵影策略 Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 16px; background:#0b1020; color:#f5f5f5; }
+    h1 { margin-bottom: 8px; }
+    .cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:20px; }
+    .card { background:#151a2c; border-radius:12px; padding:12px 16px; min-width:160px; box-shadow:0 4px 16px rgba(0,0,0,0.4); }
+    .label { font-size:12px; opacity:0.7; }
+    .value { font-size:20px; font-weight:bold; margin-top:4px; }
+    canvas { background:#0b1020; border-radius:12px; padding:8px; }
+    .chart-row { display:flex; flex-wrap:wrap; gap:20px; }
+    .chart-box { flex:1 1 280px; }
+    a { color:#4fc3f7; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <h1>獵影策略 Dashboard</h1>
+  <div class="label">資料來源：trades.json（來自 LINE Bot 實際互動）</div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">總紀錄數</div>
+      <div class="value" id="totalTrades">-</div>
+    </div>
+    <div class="card">
+      <div class="label">盤整次數 (range)</div>
+      <div class="value" id="rangeCount">-</div>
+    </div>
+    <div class="card">
+      <div class="label">趨勢次數 (trend)</div>
+      <div class="value" id="trendCount">-</div>
+    </div>
+    <div class="card">
+      <div class="label">策略可用比例</div>
+      <div class="value" id="allowedRatio">-</div>
+    </div>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-box">
+      <canvas id="regimeChart" height="240"></canvas>
+    </div>
+    <div class="chart-box">
+      <canvas id="timelineChart" height="240"></canvas>
+    </div>
+  </div>
+
+  <script>
+    async function loadTrades() {
+      const res = await fetch('/api/trades');
+      const json = await res.json();
+      return json.trades || [];
+    }
+
+    function groupByRegime(trades) {
+      const counts = { range:0, trend:0, unknown:0 };
+      trades.forEach(t => {
+        const r = t.regime || 'unknown';
+        if (counts[r] === undefined) counts[r] = 0;
+        counts[r] += 1;
+      });
+      return counts;
+    }
+
+    function buildTimeline(trades) {
+      const byDay = {};
+      trades.forEach(t => {
+        const d = (t.time || '').slice(0,10);
+        if (!d) return;
+        if (!byDay[d]) byDay[d] = { total:0, range:0 };
+        byDay[d].total += 1;
+        if (t.regime === 'range') byDay[d].range += 1;
+      });
+      const days = Object.keys(byDay).sort();
+      return {
+        labels: days,
+        total: days.map(d => byDay[d].total),
+        range: days.map(d => byDay[d].range)
+      };
+    }
+
+    function makeRegimeChart(ctx, counts) {
+      new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['range(盤整)','trend(趨勢)','unknown'],
+          datasets: [{
+            data: [counts.range, counts.trend, counts.unknown]
+          }]
+        },
+        options: {
+          plugins: {
+            legend: { labels: { color:'#f5f5f5' } }
+          }
+        }
+      });
+    }
+
+    function makeTimelineChart(ctx, timeline) {
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: timeline.labels,
+          datasets: [
+            { label:'總紀錄數', data: timeline.total, borderWidth:2 },
+            { label:'盤整次數(range)', data: timeline.range, borderWidth:2 }
+          ]
+        },
+        options: {
+          scales: {
+            x: { ticks:{ color:'#f5f5f5' } },
+            y: { ticks:{ color:'#f5f5f5' } }
+          },
+          plugins: {
+            legend: { labels: { color:'#f5f5f5' } }
+          }
+        }
+      });
+    }
+
+    (async function init() {
+      const trades = await loadTrades();
+
+      const total = trades.length;
+      const counts = groupByRegime(trades);
+      const allowedCount = trades.filter(t => t.strategyAllowed).length;
+      const allowedRatio = total ? (allowedCount * 100 / total).toFixed(1) + '%' : '-';
+
+      document.getElementById('totalTrades').textContent = total;
+      document.getElementById('rangeCount').textContent = counts.range || 0;
+      document.getElementById('trendCount').textContent = counts.trend || 0;
+      document.getElementById('allowedRatio').textContent = allowedRatio;
+
+      const timeline = buildTimeline(trades);
+
+      const regimeCtx = document.getElementById('regimeChart').getContext('2d');
+      makeRegimeChart(regimeCtx, counts);
+
+      const tlCtx = document.getElementById('timelineChart').getContext('2d');
+      makeTimelineChart(tlCtx, timeline);
+    })();
+  </script>
+</body>
+</html>`;
+
+app.get("/dashboard", (req, res) => {
+  res.type("html").send(dashboardHtml);
+});
+
+// ---------------- 啟動伺服器 ----------------
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
