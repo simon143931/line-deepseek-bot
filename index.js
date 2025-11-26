@@ -68,17 +68,42 @@ function verifyLineSignature(req, res, next) {
 
 const TRADES_FILE = "./trades.json";
 
+// 讀取交易紀錄（自動修復壞掉的 trades.json）
 async function loadTrades() {
   try {
-    const txt = await fs.readFile(TRADES_FILE, "utf-8");
-    const data = JSON.parse(txt);
-    return Array.isArray(data) ? data : [];
-  } catch (e) {
-    if (e.code === "ENOENT") return [];
-    console.error("loadTrades error:", e);
+    const text = await fs.promises.readFile(TRADES_FILE, "utf8");
+
+    try {
+      const data = JSON.parse(text);
+
+      // 正常情況：是 array 就直接用
+      if (Array.isArray(data)) return data;
+
+      console.warn("trades.json 內容不是陣列，將自動重設為 [].");
+    } catch (parseErr) {
+      // JSON 壞掉（有 // 註解、少括號等等）
+      console.warn(
+        "trades.json JSON 解析失敗，將自動重設為 []. 錯誤：",
+        parseErr.message
+      );
+    }
+
+    // 只要走到這裡，就是內容不對 → 自動重設
+    await fs.promises.writeFile(TRADES_FILE, "[]", "utf8");
+    return [];
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      // 檔案不存在 → 自動建立空陣列
+      console.warn("trades.json 不存在，將自動建立空檔案。");
+      await fs.promises.writeFile(TRADES_FILE, "[]", "utf8");
+      return [];
+    }
+
+    console.error("loadTrades error（無法讀寫檔案）：", err);
     return [];
   }
 }
+
 
 async function saveTrades(trades) {
   try {
