@@ -34,6 +34,48 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
+// Debug API：查看 trades.json 內容 & 簡單統計
+app.get("/debug/trades", async (req, res) => {
+  try {
+    const trades = await loadTrades(); // 用你前面已經定義好的 loadTrades()
+
+    const total = trades.length;
+    const wins = trades.filter((t) => t.result === "win").length;
+    const losses = trades.filter((t) => t.result === "loss").length;
+
+    const winRate = total ? Number(((wins / total) * 100).toFixed(2)) : 0;
+
+    // 平均 R 倍數（如果你有存 rMultiple 的話）
+    let avgR = 0;
+    if (total) {
+      const sumR = trades.reduce((sum, t) => {
+        const r = typeof t.rMultiple === "number" ? t.rMultiple : 0;
+        return sum + r;
+      }, 0);
+      avgR = Number((sumR / total).toFixed(2));
+    }
+
+    res.json({
+      ok: true,
+      summary: {
+        totalTrades: total,
+        wins,
+        losses,
+        winRatePercent: winRate,
+        avgR,
+      },
+      trades, // 全部原始紀錄一起丟出去
+    });
+  } catch (err) {
+    console.error("GET /debug/trades error:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message || String(err),
+    });
+  }
+});
+
+
 function redactedKey(k) {
   if (!k) return "(empty)";
   return k.slice(0, 4) + "..." + k.slice(-4);
